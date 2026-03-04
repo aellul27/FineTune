@@ -111,10 +111,22 @@ final class AudioDeviceMonitor {
             var inputDeviceList: [AudioDevice] = []
 
             for deviceID in deviceIDs {
-                guard !deviceID.isAggregateDevice() else { continue }
+                // Respect user preference for showing aggregate devices
+                if deviceID.isAggregateDevice() {
+                    let showAggregates = SettingsManager().showAggregateDevices
+                    if !showAggregates { continue }
+                }
 
                 guard let uid = try? deviceID.readDeviceUID(),
                       let name = try? deviceID.readDeviceName() else {
+                    continue
+                }
+
+                // Filter out known FineTune-created devices to avoid self-references
+                let lowerUID = uid.lowercased()
+                let lowerName = name.lowercased()
+                let bundleID = Bundle.main.bundleIdentifier?.lowercased() ?? "finetune"
+                if lowerUID.contains("finetune") || lowerName.contains("finetune") || (!bundleID.isEmpty && lowerUID.contains(bundleID)) {
                     continue
                 }
 
