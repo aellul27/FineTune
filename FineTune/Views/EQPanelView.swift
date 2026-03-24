@@ -30,7 +30,7 @@ struct EQPanelView: View {
                         }
                     Text("EQ")
                         .font(DesignTokens.Typography.pickerText)
-                        .foregroundColor(.primary)
+                        .foregroundStyle(.primary)
                 }
 
                 Spacer()
@@ -39,7 +39,7 @@ struct EQPanelView: View {
                 HStack(spacing: DesignTokens.Spacing.sm) {
                     Text("Preset")
                         .font(DesignTokens.Typography.pickerText)
-                        .foregroundColor(DesignTokens.Colors.textSecondary)
+                        .foregroundStyle(DesignTokens.Colors.textSecondary)
 
                     EQPresetPicker(
                         selectedPreset: currentPreset,
@@ -65,6 +65,9 @@ struct EQPanelView: View {
                     .frame(width: 26, height: 100)
                 }
             }
+            .opacity(settings.isEnabled ? 1.0 : 0.3)
+            .allowsHitTesting(settings.isEnabled)
+            .animation(.easeInOut(duration: 0.2), value: settings.isEnabled)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 10)

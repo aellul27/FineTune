@@ -11,7 +11,7 @@ private struct AppFingerprint: Hashable {
 
 @Observable
 @MainActor
-final class AudioProcessMonitor {
+final class AudioProcessMonitor: AudioProcessMonitoring {
     private(set) var activeApps: [AudioApp] = []
     var onAppsChanged: (([AudioApp]) -> Void)?
 
@@ -192,7 +192,9 @@ final class AudioProcessMonitor {
         periodicRefreshTask?.cancel()
         periodicRefreshTask = Task { @MainActor [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(3))
+                // 10s is sufficient as a safety net — HAL listeners handle most changes.
+                // Lower intervals waste CPU at idle (#176).
+                try? await Task.sleep(for: .seconds(10))
                 guard !Task.isCancelled, let self else { return }
                 self.refresh()
             }
@@ -331,7 +333,11 @@ final class AudioProcessMonitor {
             mElement: kAudioObjectPropertyElementMain
         )
 
-        AudioObjectRemovePropertyListenerBlock(objectID, &address, .main, block)
+        let status = AudioObjectRemovePropertyListenerBlock(objectID, &address, .main, block)
+        // Tolerate kAudioHardwareBadObjectError (-66680): process object already destroyed
+        if status != noErr && status != OSStatus(kAudioHardwareBadObjectError) {
+            logger.warning("Failed to remove isRunning listener for \(objectID): \(status)")
+        }
     }
 
     private func removeAllProcessListeners() {

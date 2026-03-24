@@ -10,6 +10,8 @@ struct MenuBarPopupView: View {
     /// Icon style that was applied at app launch (for restart-required detection)
     let launchIconStyle: MenuBarIconStyle
 
+    let permission: AudioRecordingPermission
+
     /// Memoized sorted output devices - only recomputed when device list or default changes
     @State private var sortedDevices: [AudioDevice] = []
 
@@ -49,7 +51,7 @@ struct MenuBarPopupView: View {
     /// Whether Bluetooth hardware is powered on
     @State private var isBluetoothOn = false
 
-    /// Whether device priority edit mode is active
+    /// Whether edit mode is active (affects both device priority and app visibility)
     @State private var isEditingDevicePriority = false
 
     /// Tracks which tab was active when edit mode started (for correct save on exit)
@@ -105,7 +107,7 @@ struct MenuBarPopupView: View {
                     updateManager: updateManager,
                     launchIconStyle: launchIconStyle,
                     onResetAll: {
-                        audioEngine.settingsManager.resetAllSettings()
+                        audioEngine.handleSettingsReset()
                         localAppSettings = audioEngine.settingsManager.appSettings
                         // Sync Core Audio: system sounds should follow default after reset
                         deviceVolumeMonitor.setSystemFollowDefault()
@@ -159,6 +161,9 @@ struct MenuBarPopupView: View {
                 updateSortedDevices()
                 updateSortedInputDevices()
             }
+            if !oldValue.lockInputDevice && newValue.lockInputDevice {
+                audioEngine.handleInputLockEnabled()
+            }
         }
         .onChange(of: audioEngine.bluetoothDeviceMonitor.pairedDevices) { _, newValue in
             pairedDevices = newValue
@@ -193,20 +198,20 @@ struct MenuBarPopupView: View {
 
     /// Edit priority button — pencil ↔ checkmark, styled to match settingsButton
     private var editPriorityButton: some View {
-        Button {
+        Button(isEditingDevicePriority ? "Done reordering" : "Reorder devices",
+               systemImage: isEditingDevicePriority ? "checkmark" : "pencil") {
             toggleDevicePriorityEdit()
-        } label: {
-            Image(systemName: isEditingDevicePriority ? "checkmark" : "pencil")
-                .font(.system(size: 12, weight: isEditingDevicePriority ? .bold : .regular))
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(DesignTokens.Colors.interactiveDefault)
-                .frame(
-                    minWidth: DesignTokens.Dimensions.minTouchTarget,
-                    minHeight: DesignTokens.Dimensions.minTouchTarget
-                )
-                .contentShape(Rectangle())
         }
+        .labelStyle(.iconOnly)
         .buttonStyle(.plain)
+        .font(.system(size: 12, weight: isEditingDevicePriority ? .bold : .regular))
+        .symbolRenderingMode(.hierarchical)
+        .foregroundStyle(DesignTokens.Colors.interactiveDefault)
+        .frame(
+            minWidth: DesignTokens.Dimensions.minTouchTarget,
+            minHeight: DesignTokens.Dimensions.minTouchTarget
+        )
+        .contentShape(Rectangle())
         .animation(.spring(response: 0.3, dampingFraction: 0.75), value: isEditingDevicePriority)
         .help(isEditingDevicePriority ? "Done reordering" : "Reorder devices")
     }
@@ -215,21 +220,21 @@ struct MenuBarPopupView: View {
 
     /// Settings button with gear ↔ X morphing animation
     private var settingsButton: some View {
-        Button {
+        Button(isSettingsOpen ? "Close Settings" : "Settings",
+               systemImage: isSettingsOpen ? "xmark" : "gearshape.fill") {
             toggleSettings()
-        } label: {
-            Image(systemName: isSettingsOpen ? "xmark" : "gearshape.fill")
-                .font(.system(size: 12, weight: isSettingsOpen ? .bold : .regular))
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(DesignTokens.Colors.interactiveDefault)
-                .rotationEffect(.degrees(isSettingsOpen ? 90 : 0))
-                .frame(
-                    minWidth: DesignTokens.Dimensions.minTouchTarget,
-                    minHeight: DesignTokens.Dimensions.minTouchTarget
-                )
-                .contentShape(Rectangle())
         }
+        .labelStyle(.iconOnly)
         .buttonStyle(.plain)
+        .font(.system(size: 12, weight: isSettingsOpen ? .bold : .regular))
+        .symbolRenderingMode(.hierarchical)
+        .foregroundStyle(DesignTokens.Colors.interactiveDefault)
+        .rotationEffect(.degrees(isSettingsOpen ? 90 : 0))
+        .frame(
+            minWidth: DesignTokens.Dimensions.minTouchTarget,
+            minHeight: DesignTokens.Dimensions.minTouchTarget
+        )
+        .contentShape(Rectangle())
         .animation(.spring(response: 0.3, dampingFraction: 0.75), value: isSettingsOpen)
     }
 
@@ -237,6 +242,8 @@ struct MenuBarPopupView: View {
     private func handleEscape() {
         if isSettingsOpen {
             toggleSettings()
+        } else if isEditingDevicePriority {
+            toggleDevicePriorityEdit()
         } else if expandedRowID != nil {
             // Collapse any expanded app EQ panel
             withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
@@ -256,7 +263,8 @@ struct MenuBarPopupView: View {
             isSettingsOpen.toggle()
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+        Task {
+            try? await Task.sleep(for: .seconds(0.4))
             isSettingsAnimating = false
         }
     }
@@ -271,12 +279,8 @@ struct MenuBarPopupView: View {
         Divider()
             .padding(.vertical, DesignTokens.Spacing.xs)
 
-        // Apps section (active + pinned inactive)
-        if audioEngine.displayableApps.isEmpty {
-            emptyStateView
-        } else {
-            appsSection
-        }
+        // Apps section (active + pinned inactive + hidden in edit mode)
+        appsSection
 
         Divider()
             .padding(.vertical, DesignTokens.Spacing.xs)
@@ -482,6 +486,7 @@ struct MenuBarPopupView: View {
                         let filteredPaired = pairedDevices.filter { !connectedNames.contains($0.name) }
                         if !filteredPaired.isEmpty {
                             SectionHeader(title: "Paired")
+                                .frame(maxWidth: .infinity, alignment: .leading)
                                 .padding(.top, DesignTokens.Spacing.xs)
 
                             ForEach(filteredPaired) { device in
@@ -531,7 +536,7 @@ struct MenuBarPopupView: View {
                         isMuted: deviceVolumeMonitor.muteStates[device.id] ?? false,
                         hasVolumeControl: audioEngine.hasVolumeControl(for: device.id),
                         onSetDefault: {
-                            deviceVolumeMonitor.setDefaultDevice(device.id)
+                            audioEngine.setDefaultOutputDevice(device.id)
                         },
                         onVolumeChange: { volume in
                             deviceVolumeMonitor.setVolume(for: device.id, to: volume)
@@ -561,7 +566,11 @@ struct MenuBarPopupView: View {
                                 audioEngine.settingsManager.favoriteAutoEQProfile(id: id)
                             }
                         },
-                        autoEQImportError: autoEQImportError
+                        autoEQImportError: autoEQImportError,
+                        autoEQPreampEnabled: audioEngine.autoEQPreampEnabled,
+                        onAutoEQPreampToggle: {
+                            audioEngine.setAutoEQPreampEnabled(!audioEngine.autoEQPreampEnabled)
+                        }
                     )
                 }
 
@@ -580,6 +589,13 @@ struct MenuBarPopupView: View {
                 Text("No apps playing audio")
                     .font(.callout)
                     .foregroundStyle(DesignTokens.Colors.textSecondary)
+
+                let ignoredCount = audioEngine.settingsManager.getIgnoredAppInfo().count
+                if ignoredCount > 0 {
+                    Text("\(ignoredCount) ignored · edit to manage")
+                        .font(DesignTokens.Typography.caption)
+                        .foregroundStyle(DesignTokens.Colors.textTertiary)
+                }
             }
             Spacer()
         }
@@ -588,21 +604,115 @@ struct MenuBarPopupView: View {
 
     @ViewBuilder
     private var appsSection: some View {
-        SectionHeader(title: "Apps")
-            .padding(.bottom, DesignTokens.Spacing.xs)
-
-        // ScrollViewReader needed for EQ expand scroll-to behavior
-        ScrollViewReader { scrollProxy in
-            if audioEngine.displayableApps.count > appScrollThreshold {
-                ScrollView {
-                    appsContent(scrollProxy: scrollProxy)
-                }
-                .scrollIndicators(.never)
-                .frame(height: appScrollHeight)
-            } else {
-                appsContent(scrollProxy: scrollProxy)
+        HStack {
+            SectionHeader(title: "Apps")
+            Spacer()
+            let ignoredCount = audioEngine.settingsManager.getIgnoredAppInfo().count
+            if ignoredCount > 0 && !isEditingDevicePriority {
+                Text("\(ignoredCount) ignored")
+                    .font(DesignTokens.Typography.caption)
+                    .foregroundStyle(DesignTokens.Colors.textTertiary)
             }
         }
+        .padding(.bottom, DesignTokens.Spacing.xs)
+
+        if permission.status != .authorized {
+            PermissionBannerView(permission: permission)
+        } else if isEditingDevicePriority {
+            appEditModeContent
+        } else if audioEngine.displayableApps.isEmpty {
+            emptyStateView
+        } else {
+            ScrollViewReader { scrollProxy in
+                if audioEngine.displayableApps.count > appScrollThreshold {
+                    ScrollView {
+                        appsContent(scrollProxy: scrollProxy)
+                    }
+                    .scrollIndicators(.never)
+                    .frame(height: appScrollHeight)
+                } else {
+                    appsContent(scrollProxy: scrollProxy)
+                }
+            }
+        }
+    }
+
+    /// Edit mode content for apps: simplified rows with eye toggle + hidden section at bottom.
+    private let appEditColumns = [
+        GridItem(.flexible(), spacing: DesignTokens.Spacing.xs),
+        GridItem(.flexible(), spacing: DesignTokens.Spacing.xs)
+    ]
+
+    @ViewBuilder
+    private var appEditModeContent: some View {
+        VStack(alignment: .leading, spacing: DesignTokens.Spacing.xs) {
+            // Visible apps in 2-column grid
+            LazyVGrid(columns: appEditColumns, spacing: DesignTokens.Spacing.xs) {
+                ForEach(audioEngine.displayableApps) { displayableApp in
+                    switch displayableApp {
+                    case .active(let app):
+                        AppEditRow(
+                            icon: app.icon,
+                            name: app.name,
+                            isIgnored: false,
+                            isPinned: audioEngine.isPinned(app),
+                            onToggleVisibility: { audioEngine.ignoreApp(app) },
+                            onTogglePin: {
+                                if audioEngine.isPinned(app) {
+                                    audioEngine.unpinApp(app.persistenceIdentifier)
+                                } else {
+                                    audioEngine.pinApp(app)
+                                }
+                            }
+                        )
+                    case .pinnedInactive(let info):
+                        AppEditRow(
+                            icon: displayableApp.icon,
+                            name: info.displayName,
+                            isIgnored: false,
+                            isPinned: true,
+                            onToggleVisibility: {
+                                let hiddenInfo = IgnoredAppInfo(
+                                    persistenceIdentifier: info.persistenceIdentifier,
+                                    displayName: info.displayName,
+                                    bundleID: info.bundleID
+                                )
+                                audioEngine.settingsManager.ignoreApp(info.persistenceIdentifier, info: hiddenInfo)
+                            },
+                            onTogglePin: {
+                                audioEngine.unpinApp(info.persistenceIdentifier)
+                            }
+                        )
+                    }
+                }
+            }
+
+            // Ignored apps section
+            let ignoredApps = audioEngine.settingsManager.getIgnoredAppInfo()
+                .sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+            if !ignoredApps.isEmpty {
+                Divider()
+                    .padding(.vertical, DesignTokens.Spacing.xs)
+
+                Text("Ignored")
+                    .sectionHeaderStyle()
+                    .padding(.bottom, DesignTokens.Spacing.xs)
+
+                LazyVGrid(columns: appEditColumns, spacing: DesignTokens.Spacing.xs) {
+                    ForEach(ignoredApps, id: \.persistenceIdentifier) { info in
+                        AppEditRow(
+                            icon: DisplayableApp.loadIcon(bundleID: info.bundleID),
+                            name: info.displayName,
+                            isIgnored: true,
+                            isPinned: false,
+                            onToggleVisibility: { audioEngine.unignoreApp(info.persistenceIdentifier) },
+                            onTogglePin: {}
+                        )
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private func appsContent(scrollProxy: ScrollViewProxy) -> some View {
@@ -634,8 +744,10 @@ struct MenuBarPopupView: View {
                 isFollowingDefault: audioEngine.isFollowingDefault(for: app),
                 defaultDeviceUID: deviceVolumeMonitor.defaultDeviceUID,
                 deviceSelectionMode: audioEngine.getDeviceSelectionMode(for: app),
-                maxVolumeBoost: audioEngine.settingsManager.appSettings.maxVolumeBoost,
-                isPinned: audioEngine.isPinned(app),
+                boost: audioEngine.getBoost(for: app),
+                onBoostChange: { boost in
+                    audioEngine.setBoost(for: app, to: boost)
+                },
                 getAudioLevel: { audioEngine.getAudioLevel(for: app) },
                 isPopupVisible: isPopupVisible,
                 onVolumeChange: { volume in
@@ -658,13 +770,6 @@ struct MenuBarPopupView: View {
                 },
                 onAppActivate: {
                     activateApp(pid: app.id, bundleID: app.bundleID)
-                },
-                onPinToggle: {
-                    if audioEngine.isPinned(app) {
-                        audioEngine.unpinApp(app.persistenceIdentifier)
-                    } else {
-                        audioEngine.pinApp(app)
-                    }
                 },
                 eqSettings: audioEngine.getEQSettings(for: app),
                 onEQChange: { settings in
@@ -694,7 +799,10 @@ struct MenuBarPopupView: View {
             defaultDeviceUID: deviceVolumeMonitor.defaultDeviceUID,
             deviceSelectionMode: audioEngine.getDeviceSelectionModeForInactive(identifier: identifier),
             isMuted: audioEngine.getMuteForInactive(identifier: identifier),
-            maxVolumeBoost: audioEngine.settingsManager.appSettings.maxVolumeBoost,
+            boost: audioEngine.getBoostForInactive(identifier: identifier),
+            onBoostChange: { boost in
+                audioEngine.setBoostForInactive(identifier: identifier, to: boost)
+            },
             onVolumeChange: { volume in
                 audioEngine.setVolumeForInactive(identifier: identifier, to: volume)
             },
@@ -712,9 +820,6 @@ struct MenuBarPopupView: View {
             },
             onSelectFollowDefault: {
                 audioEngine.setDeviceRoutingForInactive(identifier: identifier, deviceUID: nil)
-            },
-            onUnpin: {
-                audioEngine.unpinApp(identifier)
             },
             eqSettings: audioEngine.getEQSettingsForInactive(identifier: identifier),
             onEQChange: { settings in
@@ -745,7 +850,8 @@ struct MenuBarPopupView: View {
             }
         }
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+        Task {
+            try? await Task.sleep(for: .seconds(0.4))
             isEQAnimating = false
         }
     }
@@ -770,13 +876,19 @@ struct MenuBarPopupView: View {
         }
     }
 
-    /// Persists the editable order to the correct priority list.
+    /// Persists the editable order to the correct priority list, preserving disconnected device positions.
     private func persistEditableOrder() {
-        let uids = editableDeviceOrder.map(\.uid)
+        let connectedOrder = editableDeviceOrder.map(\.uid)
         if wasEditingInputDevices {
-            audioEngine.settingsManager.setInputDevicePriorityOrder(uids)
+            audioEngine.settingsManager.mergeInputDevicePriorityOrder(
+                oldPriority: audioEngine.settingsManager.inputDevicePriorityOrder,
+                connectedOrder: connectedOrder
+            )
         } else {
-            audioEngine.settingsManager.setDevicePriorityOrder(uids)
+            audioEngine.settingsManager.mergeDevicePriorityOrder(
+                oldPriority: audioEngine.settingsManager.devicePriorityOrder,
+                connectedOrder: connectedOrder
+            )
         }
     }
 
@@ -789,9 +901,12 @@ struct MenuBarPopupView: View {
 
     /// Merges device list changes into `editableDeviceOrder` while preserving the user's reordering.
     /// Existing devices are refreshed (CoreAudio may reassign AudioDeviceIDs), removed devices are
-    /// dropped, and new devices are appended at the end.
+    /// dropped, and reconnecting devices are inserted at their saved priority position.
     private func mergeDeviceChanges(from latest: [AudioDevice]) {
         let latestByUID = Dictionary(latest.map { ($0.uid, $0) }, uniquingKeysWith: { _, new in new })
+        let priorityOrder = wasEditingInputDevices
+            ? audioEngine.settingsManager.inputDevicePriorityOrder
+            : audioEngine.settingsManager.devicePriorityOrder
 
         withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
             // Remove devices that disappeared
@@ -804,11 +919,48 @@ struct MenuBarPopupView: View {
                 }
             }
 
-            // Append newly appeared devices
+            // Insert reconnecting devices at their saved priority position
             let existingUIDs = Set(editableDeviceOrder.map(\.uid))
             let newDevices = latest.filter { !existingUIDs.contains($0.uid) }
-            editableDeviceOrder.append(contentsOf: newDevices)
+            for device in newDevices {
+                let index = Self.priorityInsertionIndex(
+                    for: device.uid,
+                    in: editableDeviceOrder.map(\.uid),
+                    priorityOrder: priorityOrder
+                )
+                editableDeviceOrder.insert(device, at: index)
+            }
         }
+    }
+
+    /// Finds the best insertion index for a reconnecting device based on saved priority order.
+    ///
+    /// Walks `priorityOrder` to find the UIDs that come before and after `uid`, then
+    /// places the device between them in `currentOrder`. Falls back to appending at the end
+    /// if the device isn't in the priority list or no neighbors are present.
+    ///
+    /// - Parameters:
+    ///   - uid: The device UID to insert.
+    ///   - currentOrder: The current list of device UIDs.
+    ///   - priorityOrder: The saved full priority list.
+    /// - Returns: The index at which to insert the device.
+    static func priorityInsertionIndex(for uid: String, in currentOrder: [String], priorityOrder: [String]) -> Int {
+        guard let priorityIndex = priorityOrder.firstIndex(of: uid) else {
+            // Brand new device not in priority list — append at end
+            return currentOrder.count
+        }
+
+        // Find the closest priority neighbor that exists in currentOrder and comes AFTER uid in priority.
+        // Insert before that neighbor so uid takes its correct position.
+        for i in (priorityIndex + 1)..<priorityOrder.count {
+            let successor = priorityOrder[i]
+            if let currentIndex = currentOrder.firstIndex(of: successor) {
+                return currentIndex
+            }
+        }
+
+        // No successor found — insert at end
+        return currentOrder.count
     }
 
     // MARK: - Helpers

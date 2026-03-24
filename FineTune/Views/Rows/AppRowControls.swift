@@ -6,17 +6,17 @@ import SwiftUI
 struct AppRowControls: View {
     let volume: Float
     let isMuted: Bool
-    let audioLevel: Float
     let devices: [AudioDevice]
     let selectedDeviceUID: String
     let selectedDeviceUIDs: Set<String>
     let isFollowingDefault: Bool
     let defaultDeviceUID: String?
     let deviceSelectionMode: DeviceSelectionMode
-    let maxVolumeBoost: Float
+    let boost: BoostLevel
     let isEQExpanded: Bool
     let onVolumeChange: (Float) -> Void
     let onMuteChange: (Bool) -> Void
+    let onBoostChange: (BoostLevel) -> Void
     let onDeviceSelected: (String) -> Void
     let onDevicesSelected: (Set<String>) -> Void
     let onDeviceModeChange: (DeviceSelectionMode) -> Void
@@ -27,7 +27,7 @@ struct AppRowControls: View {
     @State private var isEQButtonHovered = false
 
     private var sliderValue: Double {
-        dragOverrideValue ?? VolumeMapping.gainToSlider(volume, maxBoost: maxVolumeBoost)
+        dragOverrideValue ?? VolumeMapping.gainToSlider(volume)
     }
 
     private var showMutedIcon: Bool { isMuted || sliderValue == 0 }
@@ -62,14 +62,14 @@ struct AppRowControls: View {
                     get: { sliderValue },
                     set: { newValue in
                         dragOverrideValue = newValue
-                        let gain = VolumeMapping.sliderToGain(newValue, maxBoost: maxVolumeBoost)
+                        let gain = VolumeMapping.sliderToGain(newValue)
                         onVolumeChange(gain)
                         if isMuted {
                             onMuteChange(false)
                         }
                     }
                 ),
-                showUnityMarker: true,
+                showUnityMarker: false,
                 onEditingChanged: { editing in
                     if !editing {
                         dragOverrideValue = nil
@@ -79,23 +79,23 @@ struct AppRowControls: View {
             .frame(width: DesignTokens.Dimensions.sliderWidth)
             .opacity(showMutedIcon ? 0.5 : 1.0)
 
-            // Editable volume percentage
+            // Editable volume percentage (shows slider position, not raw gain)
             EditablePercentage(
                 percentage: Binding(
                     get: {
-                        let gain = VolumeMapping.sliderToGain(sliderValue, maxBoost: maxVolumeBoost)
-                        return Int(round(gain * 100))
+                        Int(round(sliderValue * 100))
                     },
                     set: { newPercentage in
-                        let gain = Float(newPercentage) / 100.0
+                        let sliderPos = Double(newPercentage) / 100.0
+                        let gain = VolumeMapping.sliderToGain(sliderPos)
                         onVolumeChange(gain)
                     }
                 ),
-                range: 0...Int(round(maxVolumeBoost * 100))
+                range: 0...100
             )
 
-            // VU Meter
-            VUMeter(level: audioLevel, isMuted: showMutedIcon)
+            // Boost chevrons
+            BoostChevrons(level: boost, onTap: { onBoostChange(boost.next) })
 
             // Device picker
             DevicePicker(
@@ -109,7 +109,8 @@ struct AppRowControls: View {
                 onDeviceSelected: onDeviceSelected,
                 onDevicesSelected: onDevicesSelected,
                 onSelectFollowDefault: onSelectFollowDefault,
-                showModeToggle: true
+                showModeToggle: true,
+                triggerWidth: 105
             )
 
             // EQ button
@@ -135,11 +136,12 @@ struct AppRowControls: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityLabel(isEQExpanded ? "Close Equalizer" : "Equalizer")
             .onHover { isEQButtonHovered = $0 }
             .help(isEQExpanded ? "Close Equalizer" : "Equalizer")
             .animation(.spring(response: 0.3, dampingFraction: 0.75), value: isEQExpanded)
             .animation(DesignTokens.Animation.hover, value: isEQButtonHovered)
         }
-        .frame(width: DesignTokens.Dimensions.controlsWidth)
+        .fixedSize()
     }
 }

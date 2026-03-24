@@ -12,6 +12,8 @@ struct AutoEQSearchPanel: View {
     let onImport: () -> Void
     let onToggleFavorite: (String) -> Void
     let importErrorMessage: String?
+    var preampEnabled: Bool = true
+    var onPreampToggle: (() -> Void)?
 
     @State private var searchText = ""
     @State private var debouncedQuery = ""
@@ -119,14 +121,13 @@ struct AutoEQSearchPanel: View {
                     .accessibilityLabel("Search headphones")
 
                 if !searchText.isEmpty {
-                    Button {
+                    Button("Clear search", systemImage: "xmark.circle.fill") {
                         searchText = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 11))
-                            .foregroundStyle(DesignTokens.Colors.textTertiary)
                     }
+                    .labelStyle(.iconOnly)
                     .buttonStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundStyle(DesignTokens.Colors.textTertiary)
                 }
             }
             .padding(.horizontal, DesignTokens.Spacing.sm)
@@ -179,6 +180,35 @@ struct AutoEQSearchPanel: View {
                let selectedProfile = profileManager.profile(for: selectedID) {
                 profileRow(selectedProfile, itemIDPrefix: "selected_")
                     .padding(.horizontal, DesignTokens.Spacing.xs)
+
+                // Preamp toggle — lets user A/B test profile preamp vs limiter-only
+                if let onPreampToggle {
+                    Button {
+                        onPreampToggle()
+                    } label: {
+                        HStack(spacing: DesignTokens.Spacing.sm) {
+                            Image(systemName: preampEnabled ? "speaker.wave.2" : "speaker.wave.3")
+                                .font(.system(size: 10))
+                                .foregroundStyle(preampEnabled ? DesignTokens.Colors.textTertiary : DesignTokens.Colors.interactiveActive)
+                                .frame(width: 14)
+
+                            Text(preampEnabled ? "Preamp on (quieter, no clipping)" : "Preamp off (louder, limiter active)")
+                                .font(.system(size: 10))
+                                .foregroundStyle(DesignTokens.Colors.textSecondary)
+
+                            Spacer()
+                        }
+                        .padding(.horizontal, DesignTokens.Spacing.sm)
+                        .frame(height: 22)
+                        .background(
+                            RoundedRectangle(cornerRadius: 5)
+                                .fill(hoveredID == "_preamp" ? Color.white.opacity(0.04) : Color.clear)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .whenHovered { hoveredID = $0 ? "_preamp" : nil }
+                    .padding(.horizontal, DesignTokens.Spacing.xs)
+                }
             }
 
             // Results / Favorites / Empty state
@@ -420,6 +450,7 @@ struct AutoEQSearchPanel: View {
             onSelect(profile)
             onDismiss()
         }
+        .accessibilityAddTraits(.isButton)
         .whenHovered { isHovered in
             hoveredID = isHovered ? profile.id : nil
             if isHovered { highlightedIndex = nil }
@@ -479,6 +510,7 @@ struct AutoEQSearchPanel: View {
         .onTapGesture {
             selectCatalogEntry(entry)
         }
+        .accessibilityAddTraits(.isButton)
         .whenHovered { isHovered in
             hoveredID = isHovered ? entry.id : nil
             if isHovered { highlightedIndex = nil }

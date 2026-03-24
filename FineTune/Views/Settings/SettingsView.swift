@@ -76,14 +76,6 @@ struct SettingsView: View {
                 range: 0.1...1.0
             )
 
-            SettingsSliderRow(
-                icon: "speaker.wave.3",
-                title: "Max Volume Boost",
-                description: "Safety limit for volume slider",
-                value: $settings.maxVolumeBoost,
-                range: 1.0...4.0
-            )
-
             SettingsToggleRow(
                 icon: "mic",
                 title: "Lock Input Device",
@@ -197,7 +189,7 @@ struct SettingsView: View {
 
     private var aboutFooter: some View {
         let startYear = 2026
-        let currentYear = Calendar.current.component(.year, from: Date())
+        let currentYear = Calendar.current.component(.year, from: .now)
         let yearText = startYear == currentYear ? "\(startYear)" : "\(startYear)-\(currentYear)"
 
         return HStack(spacing: DesignTokens.Spacing.xs) {

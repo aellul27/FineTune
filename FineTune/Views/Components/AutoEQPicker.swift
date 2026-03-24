@@ -12,6 +12,8 @@ struct AutoEQPicker: View {
     let onImport: () -> Void
     let onToggleFavorite: (String) -> Void
     let importError: String?
+    var preampEnabled: Bool = true
+    var onPreampToggle: (() -> Void)?
 
     @State private var isExpanded = false
     @State private var isButtonHovered = false
@@ -24,9 +26,9 @@ struct AutoEQPicker: View {
 
     private var iconColor: Color {
         if isExpanded {
-            return DesignTokens.Colors.interactiveActive
+            return DesignTokens.Colors.accentPrimary
         } else if profileName != nil {
-            return DesignTokens.Colors.interactiveActive
+            return DesignTokens.Colors.accentPrimary
         } else if isButtonHovered {
             return DesignTokens.Colors.interactiveHover
         }
@@ -53,7 +55,7 @@ struct AutoEQPicker: View {
             }
         } label: {
             Image(systemName: "wand.and.sparkles")
-                .font(.system(size: 14))
+                .font(.system(size: 16))
                 .symbolRenderingMode(.hierarchical)
                 .foregroundStyle(iconColor)
                 .frame(
@@ -92,7 +94,9 @@ struct AutoEQPicker: View {
                     onImport()
                 },
                 onToggleFavorite: onToggleFavorite,
-                importErrorMessage: importError
+                importErrorMessage: importError,
+                preampEnabled: preampEnabled,
+                onPreampToggle: onPreampToggle
             )
         }
         .frame(width: popoverWidth)

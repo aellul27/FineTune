@@ -5,7 +5,7 @@ import os
 
 @Observable
 @MainActor
-final class AudioDeviceMonitor {
+final class AudioDeviceMonitor: AudioDeviceProviding {
     // MARK: - Output Devices
 
     private(set) var outputDevices: [AudioDevice] = []
@@ -70,6 +70,11 @@ final class AudioDeviceMonitor {
     /// Listeners for kAudioDevicePropertyDataSource changes on built-in devices (headphone jack detection)
     @ObservationIgnored private var dataSourceListeners: [AudioDeviceID: AudioObjectPropertyListenerBlock] = [:]
 
+    /// Debounces rapid HAL device-list notifications (e.g. Bluetooth connect fires 2-3 in ~20ms).
+    /// Querying device properties during the burst produces HALC_ShellObject errors because
+    /// HAL proxy objects are mid-transition. 50ms lets the HAL stabilize before we enumerate.
+    private var deviceListDebounceTask: Task<Void, Never>?
+
     func start() {
         guard deviceListListenerBlock == nil else { return }
 
@@ -79,7 +84,7 @@ final class AudioDeviceMonitor {
 
         deviceListListenerBlock = { [weak self] _, _ in
             Task { @MainActor [weak self] in
-                self?.handleDeviceListChanged()
+                self?.scheduleDeviceListRefresh()
             }
         }
 
@@ -97,6 +102,9 @@ final class AudioDeviceMonitor {
 
     func stop() {
         logger.debug("Stopping audio device monitor")
+
+        deviceListDebounceTask?.cancel()
+        deviceListDebounceTask = nil
 
         if let block = deviceListListenerBlock {
             AudioObjectRemovePropertyListenerBlock(.system, &deviceListAddress, .main, block)
@@ -229,7 +237,7 @@ final class AudioDeviceMonitor {
             )
             let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
                 Task { @MainActor [weak self] in
-                    self?.handleDeviceListChanged()
+                    self?.scheduleDeviceListRefresh()
                 }
             }
             let status = AudioObjectAddPropertyListenerBlock(deviceID, &address, .main, block)
@@ -248,7 +256,11 @@ final class AudioDeviceMonitor {
             mScope: kAudioObjectPropertyScopeOutput,
             mElement: kAudioObjectPropertyElementMain
         )
-        AudioObjectRemovePropertyListenerBlock(deviceID, &address, .main, block)
+        let status = AudioObjectRemovePropertyListenerBlock(deviceID, &address, .main, block)
+        // Tolerate kAudioHardwareBadObjectError (-66680): device was already destroyed
+        if status != noErr && status != OSStatus(kAudioHardwareBadObjectError) {
+            logger.warning("Failed to remove data source listener for device \(deviceID): \(status)")
+        }
     }
 
     private func removeAllDataSourceListeners() {
@@ -268,6 +280,18 @@ final class AudioDeviceMonitor {
         let remaining = uids.subtracting(sorted).sorted()
         sorted.append(contentsOf: remaining)
         return sorted
+    }
+
+    /// Coalesces rapid HAL notifications into a single refresh after 50ms of quiet.
+    /// Without this, querying device properties mid-burst produces HALC_ShellObject errors
+    /// because HAL proxy objects haven't stabilized yet.
+    private func scheduleDeviceListRefresh() {
+        deviceListDebounceTask?.cancel()
+        deviceListDebounceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(50))
+            guard !Task.isCancelled, let self else { return }
+            self.handleDeviceListChanged()
+        }
     }
 
     private func handleDeviceListChanged() {

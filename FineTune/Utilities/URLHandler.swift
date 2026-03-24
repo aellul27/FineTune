@@ -2,13 +2,29 @@
 import Foundation
 import os
 
+/// Protocol for the AudioEngine surface that URLHandler depends on.
+/// Extracted for testability (allows mock injection).
+@MainActor
+protocol URLHandlerEngine {
+    var apps: [AudioApp] { get }
+    var settingsManager: SettingsManager { get }
+    func setVolume(for app: AudioApp, to volume: Float)
+    func getVolume(for app: AudioApp) -> Float
+    func setMute(for app: AudioApp, to muted: Bool)
+    func getMute(for app: AudioApp) -> Bool
+    func setDevice(for app: AudioApp, deviceUID: String?)
+    func setVolumeForInactive(identifier: String, to volume: Float)
+    func setMuteForInactive(identifier: String, to muted: Bool)
+    func getMuteForInactive(identifier: String) -> Bool
+}
+
 /// Handles URL scheme actions for FineTune (finetune://...)
 @MainActor
 final class URLHandler {
-    private let audioEngine: AudioEngine
+    private let audioEngine: any URLHandlerEngine
     private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "FineTune", category: "URLHandler")
-    
-    init(audioEngine: AudioEngine) {
+
+    init(audioEngine: any URLHandlerEngine) {
         self.audioEngine = audioEngine
     }
     
@@ -49,13 +65,8 @@ final class URLHandler {
 
     /// Set volumes for one or more apps
     /// URL format: finetune://set-volumes?app=com.a&volume=100&app=com.b&volume=50
-    /// Volume is percentage: 0 to maxVolumeBoost (e.g., 0-200 or 0-400 depending on settings)
-    /// Uses linear mapping to match UI percentage input behavior
+    /// Volume is percentage: 0-100 (gain only, boost is per-app and set separately)
     private func handleSetVolumes(queryItems: [URLQueryItem]) {
-        // Get user's max volume boost setting (1.0-4.0 = 100%-400%)
-        let maxBoost = audioEngine.settingsManager.appSettings.maxVolumeBoost
-        let maxPercent = Int(maxBoost * 100)
-
         var pairs: [(identifier: String, volume: Int)] = []
         var currentApp: String?
 
@@ -71,8 +82,8 @@ final class URLHandler {
                 }
                 guard let volumeStr = item.value,
                       let volume = Int(volumeStr),
-                      (0...maxPercent).contains(volume) else {
-                    logger.warning("set-volumes: invalid volume '\(item.value ?? "nil")' for app \(app) (valid range: 0-\(maxPercent))")
+                      (0...100).contains(volume) else {
+                    logger.warning("set-volumes: invalid volume '\(item.value ?? "nil")' for app \(app) (valid range: 0-100)")
                     currentApp = nil
                     continue
                 }
@@ -94,8 +105,7 @@ final class URLHandler {
         }
 
         for (identifier, volumePercent) in pairs {
-            // Linear conversion to match UI percentage input behavior
-            // volume=100 → gain 1.0, volume=200 → gain 2.0, etc.
+            // Linear conversion: volume=100 → gain 1.0
             let gain = Float(volumePercent) / 100.0
 
             if let app = findApp(by: identifier) {
@@ -111,7 +121,7 @@ final class URLHandler {
 
     /// Step volume up or down for an app
     /// URL format: finetune://step-volume?app=com.a&direction=up (or down)
-    /// Uses slider-based stepping with user's maxVolumeBoost setting
+    /// Steps by 5% slider position
     private func handleStepVolume(queryItems: [URLQueryItem]) {
         guard let appIdentifier = queryItems.first(where: { $0.name == "app" })?.value else {
             logger.error("step-volume: missing app parameter")
@@ -128,12 +138,9 @@ final class URLHandler {
             return
         }
 
-        // Get user's max volume boost setting
-        let maxBoost = audioEngine.settingsManager.appSettings.maxVolumeBoost
-
         let currentGain = audioEngine.getVolume(for: app)
-        let stepAmount: Double = 0.05 // 5% slider position ≈ 10% volume adjustment
-        var sliderPosition = VolumeMapping.gainToSlider(currentGain, maxBoost: maxBoost)
+        let stepAmount: Double = 0.05 // 5% slider position
+        var sliderPosition = VolumeMapping.gainToSlider(currentGain)
 
         switch direction.lowercased() {
         case "up", "+":
@@ -145,7 +152,7 @@ final class URLHandler {
             return
         }
 
-        let newGain = VolumeMapping.sliderToGain(sliderPosition, maxBoost: maxBoost)
+        let newGain = VolumeMapping.sliderToGain(sliderPosition)
         audioEngine.setVolume(for: app, to: newGain)
         let newPercent = Int(round(newGain * 100))
         logger.info("Stepped volume \(direction) for \(app.name) to \(newPercent)%")

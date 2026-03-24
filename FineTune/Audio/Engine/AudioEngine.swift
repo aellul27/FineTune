@@ -7,22 +7,43 @@ import UserNotifications
 @Observable
 @MainActor
 final class AudioEngine {
-    let processMonitor = AudioProcessMonitor()
-    let deviceMonitor: AudioDeviceMonitor
-    let bluetoothDeviceMonitor = BluetoothDeviceMonitor()
-    let deviceVolumeMonitor: DeviceVolumeMonitor
+    let processMonitor: any AudioProcessMonitoring
+    var deviceMonitor: any AudioDeviceProviding
+    let bluetoothDeviceMonitor: BluetoothDeviceMonitor
+    let deviceVolumeMonitor: any DeviceVolumeProviding
     let volumeState: VolumeState
     let settingsManager: SettingsManager
     let autoEQProfileManager: AutoEQProfileManager
+    let permission: AudioRecordingPermission
 
     #if !APP_STORE
     let ddcController: DDCController
     #endif
 
-    private var taps: [pid_t: ProcessTapController] = [:]
+    private var taps: [pid_t: any ProcessTapControlling] = [:]
+
+    /// Factory for creating tap controllers. Overridable for testing.
+    private let tapFactory: @MainActor (AudioApp, [String], String?) throws -> any ProcessTapControlling
+
+    /// Closure to check if a device is alive. Overridable for testing.
+    private let isAliveCheck: (AudioDeviceID) -> Bool
+
+    /// One-shot HAL listeners for devices that were present but not alive during priority resolution.
+    /// Keyed by AudioDeviceID. Each entry holds the device UID, listener block, and a timeout task.
+    private var aliveWatchers: [AudioDeviceID: (uid: String, block: AudioObjectPropertyListenerBlock, timeout: Task<Void, Never>)] = [:]
+
+    /// Number of pending alive watchers (exposed for testing).
+    var pendingAliveWatcherCount: Int { aliveWatchers.count }
+
     private var appliedPIDs: Set<pid_t> = []
     private var appDeviceRouting: [pid_t: String] = [:]  // pid → deviceUID (always explicit)
     private var followsDefault: Set<pid_t> = []  // Apps that follow system default
+    /// The last output default confirmed by FineTune (user change or programmatic switch).
+    /// Used to restore after macOS auto-switches to a lower-priority device.
+    private var lastConfirmedDefaultUID: String?
+    /// Timestamp of the last auto-switch override. Used to distinguish rapid BT auto-switches
+    /// (< 1s apart) from deliberate user changes (> 1s after last override).
+    private var lastAutoSwitchOverrideTime: Date?
     private var pendingCleanup: [pid_t: Task<Void, Never>] = [:]  // Grace period for stale tap cleanup
     private var staleCleanupTask: Task<Void, Never>?  // Debounced cleanup scheduling
     private var healthMonitorTask: Task<Void, Never>?  // Periodic tap health monitor
@@ -137,8 +158,10 @@ final class AudioEngine {
     static func resolveHighestPriority(
         priorityOrder: [String],
         connectedDevices: [AudioDevice],
-        excluding: String? = nil
+        excluding: String? = nil,
+        isAlive: ((AudioDeviceID) -> Bool)? = nil
     ) -> AudioDevice? {
+        let aliveCheck = isAlive ?? { $0.isDeviceAlive() }
         let connected = Dictionary(
             connectedDevices.map { ($0.uid, $0) },
             uniquingKeysWith: { _, latest in latest }
@@ -146,128 +169,223 @@ final class AudioEngine {
         for uid in priorityOrder {
             guard uid != excluding,
                   let device = connected[uid],
-                  device.id.isDeviceAlive() else { continue }
+                  aliveCheck(device.id) else { continue }
             return device
         }
         // Fallback: any alive connected device not excluded
         return connectedDevices.first {
-            $0.uid != excluding && $0.id.isDeviceAlive()
+            $0.uid != excluding && aliveCheck($0.id)
         }
     }
 
 
-    init(settingsManager: SettingsManager? = nil, autoEQProfileManager: AutoEQProfileManager? = nil) {
+    init(
+        permission: AudioRecordingPermission? = nil,
+        settingsManager: SettingsManager? = nil,
+        autoEQProfileManager: AutoEQProfileManager? = nil,
+        deviceProvider: (any AudioDeviceProviding)? = nil,
+        processMonitor: (any AudioProcessMonitoring)? = nil,
+        deviceVolumeMonitor: (any DeviceVolumeProviding)? = nil,
+        tapFactory: (@MainActor (AudioApp, [String], String?) throws -> any ProcessTapControlling)? = nil,
+        isAlive: ((AudioDeviceID) -> Bool)? = nil,
+        startMonitorsAutomatically: Bool = true
+    ) {
+        self.permission = permission ?? AudioRecordingPermission()
         let manager = settingsManager ?? SettingsManager()
         self.settingsManager = manager
         self.deviceMonitor = AudioDeviceMonitor(settingsManager: manager)
         self.autoEQProfileManager = autoEQProfileManager ?? AutoEQProfileManager()
         self.volumeState = VolumeState(settingsManager: manager)
+        self.isAliveCheck = isAlive ?? { $0.isDeviceAlive() }
+
+        // If a custom deviceProvider is given, use it directly.
+        // Otherwise create a real AudioDeviceMonitor (needed by DeviceVolumeMonitor and default tap factory).
+        let realDeviceMonitor: AudioDeviceMonitor?
+        if let provider = deviceProvider {
+            realDeviceMonitor = provider as? AudioDeviceMonitor
+            self.deviceMonitor = provider
+        } else {
+            let monitor = AudioDeviceMonitor(settingsManager: manager)
+            realDeviceMonitor = monitor
+            self.deviceMonitor = monitor
+        }
+        self.processMonitor = processMonitor ?? AudioProcessMonitor()
+        self.bluetoothDeviceMonitor = BluetoothDeviceMonitor()
 
         #if !APP_STORE
         let ddc = DDCController(settingsManager: manager)
         self.ddcController = ddc
-        self.deviceVolumeMonitor = DeviceVolumeMonitor(deviceMonitor: deviceMonitor, settingsManager: manager, ddcController: ddc)
+        if let dvMonitor = deviceVolumeMonitor {
+            self.deviceVolumeMonitor = dvMonitor
+        } else {
+            guard let realDeviceMonitor else {
+                preconditionFailure("AudioEngine: must provide deviceVolumeMonitor when deviceProvider is not AudioDeviceMonitor")
+            }
+            self.deviceVolumeMonitor = DeviceVolumeMonitor(deviceMonitor: realDeviceMonitor, settingsManager: manager, ddcController: ddc)
+        }
         #else
-        self.deviceVolumeMonitor = DeviceVolumeMonitor(deviceMonitor: deviceMonitor, settingsManager: manager)
+        if let dvMonitor = deviceVolumeMonitor {
+            self.deviceVolumeMonitor = dvMonitor
+        } else {
+            guard let realDeviceMonitor else {
+                preconditionFailure("AudioEngine: must provide deviceVolumeMonitor when deviceProvider is not AudioDeviceMonitor")
+            }
+            self.deviceVolumeMonitor = DeviceVolumeMonitor(deviceMonitor: realDeviceMonitor, settingsManager: manager)
+        }
         #endif
 
+        // Tap factory: use provided factory or default to ProcessTapController
+        if let factory = tapFactory {
+            self.tapFactory = factory
+        } else {
+            self.tapFactory = { app, deviceUIDs, preferredSource in
+                if deviceUIDs.count == 1 {
+                    return ProcessTapController(
+                        app: app,
+                        targetDeviceUID: deviceUIDs[0],
+                        deviceMonitor: realDeviceMonitor,
+                        preferredTapSourceDeviceUID: preferredSource
+                    )
+                } else {
+                    return ProcessTapController(
+                        app: app,
+                        targetDeviceUIDs: deviceUIDs,
+                        deviceMonitor: realDeviceMonitor,
+                        preferredTapSourceDeviceUID: preferredSource
+                    )
+                }
+            }
+        }
+
         outputEchoTracker.onTimeout = { [weak self] _ in
-            self?.reEvaluateOutputDefault()
+            self?.restoreConfirmedDefault()
         }
         inputEchoTracker.onTimeout = { [weak self] _ in
             guard let self, self.settingsManager.appSettings.lockInputDevice else { return }
-            self.reEvaluateInputDefault()
+            self.restoreLockedInputDevice()
         }
 
-        Task { @MainActor in
-            processMonitor.start()
-            deviceMonitor.start()
-            bluetoothDeviceMonitor.start()
+        // Wire callbacks — needed for both test and production mode
+        wireCallbacks()
 
-            #if !APP_STORE
-            ddc.onProbeCompleted = { [weak self] in
-                self?.deviceVolumeMonitor.refreshAfterDDCProbe()
-            }
-            ddc.start()
-            #endif
+        if startMonitorsAutomatically {
+            Task { @MainActor in
+                if self.permission.status == .authorized {
+                    self.processMonitor.start()
+                }
+                self.deviceMonitor.start()
+                self.bluetoothDeviceMonitor.start()
 
-            // Start device volume monitor AFTER deviceMonitor.start() populates devices
-            // This fixes the race condition where volumes were read before devices existed
-            deviceVolumeMonitor.start()
+                #if !APP_STORE
+                ddc.onProbeCompleted = { [weak self] in
+                    self?.deviceVolumeMonitor.refreshAfterDDCProbe()
+                }
+                ddc.start()
+                #endif
 
-            // Sync device volume changes to taps for VU meter accuracy
-            // For multi-device output, we track the primary (clock source) device's volume
-            deviceVolumeMonitor.onVolumeChanged = { [weak self] deviceID, newVolume in
-                guard let self else { return }
-                guard let deviceUID = self.deviceMonitor.outputDevices.first(where: { $0.id == deviceID })?.uid else { return }
-                for (_, tap) in self.taps {
-                    // Update if this is the tap's primary device
-                    if tap.currentDeviceUID == deviceUID {
-                        tap.currentDeviceVolume = newVolume
-                    }
+                // Start device volume monitor AFTER deviceMonitor.start() populates devices
+                self.deviceVolumeMonitor.start()
+
+                self.applyPersistedSettings()
+                self.registerNewDevicesInPriority()
+                // Seed the confirmed default from whatever macOS has at startup
+                self.lastConfirmedDefaultUID = self.deviceVolumeMonitor.defaultDeviceUID
+                if manager.appSettings.lockInputDevice {
+                    self.restoreLockedInputDevice()
                 }
             }
+        }
 
-            // Sync device mute changes to taps for VU meter accuracy
-            deviceVolumeMonitor.onMuteChanged = { [weak self] deviceID, isMuted in
+        // Start process monitor when permission is granted
+        if startMonitorsAutomatically && permission?.status != .authorized {
+            observePermissionGranted()
+        }
+    }
+
+    private func observePermissionGranted() {
+        withObservationTracking {
+            _ = self.permission.status
+        } onChange: { [weak self] in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
-                guard let deviceUID = self.deviceMonitor.outputDevices.first(where: { $0.id == deviceID })?.uid else { return }
-                for (_, tap) in self.taps {
-                    // Update if this is the tap's primary device
-                    if tap.currentDeviceUID == deviceUID {
-                        tap.isDeviceMuted = isMuted
-                    }
+                if self.permission.status == .authorized {
+                    self.processMonitor.start()
+                    self.applyPersistedSettings()
+                    self.startHealthMonitor()
+                    self.logger.info("Audio capture authorized — process monitor started")
+                } else {
+                    self.observePermissionGranted()
                 }
             }
+        }
+    }
 
-            processMonitor.onAppsChanged = { [weak self] apps in
-                self?.applyPersistedSettings()
-                self?.scheduleStaleCleanup()
+    /// Wire all event callbacks from monitors to AudioEngine handlers.
+    private func wireCallbacks() {
+        // Sync device volume changes to taps for VU meter accuracy
+        deviceVolumeMonitor.onVolumeChanged = { [weak self] deviceID, newVolume in
+            guard let self else { return }
+            guard let deviceUID = self.deviceMonitor.outputDevices.first(where: { $0.id == deviceID })?.uid else { return }
+            for (_, tap) in self.taps {
+                if tap.currentDeviceUID == deviceUID {
+                    tap.currentDeviceVolume = newVolume
+                }
             }
+        }
 
-            deviceMonitor.outputPriorityOrder = { [weak self] in
+        deviceVolumeMonitor.onMuteChanged = { [weak self] deviceID, isMuted in
+            guard let self else { return }
+            guard let deviceUID = self.deviceMonitor.outputDevices.first(where: { $0.id == deviceID })?.uid else { return }
+            for (_, tap) in self.taps {
+                if tap.currentDeviceUID == deviceUID {
+                    tap.isDeviceMuted = isMuted
+                }
+            }
+        }
+
+        processMonitor.onAppsChanged = { [weak self] apps in
+            self?.applyPersistedSettings()
+            self?.scheduleStaleCleanup()
+        }
+
+        // Priority order closures — only for concrete AudioDeviceMonitor
+        if let realMonitor = deviceMonitor as? AudioDeviceMonitor {
+            realMonitor.outputPriorityOrder = { [weak self] in
                 self?.settingsManager.devicePriorityOrder ?? []
             }
-            deviceMonitor.inputPriorityOrder = { [weak self] in
+            realMonitor.inputPriorityOrder = { [weak self] in
                 self?.settingsManager.inputDevicePriorityOrder ?? []
             }
+        }
 
-            deviceMonitor.onDeviceDisconnected = { [weak self] deviceUID, deviceName in
-                self?.handleDeviceDisconnected(deviceUID, name: deviceName)
-                self?.bluetoothDeviceMonitor.refresh()
-            }
+        deviceMonitor.onDeviceDisconnected = { [weak self] deviceUID, deviceName in
+            self?.handleDeviceDisconnected(deviceUID, name: deviceName)
+            self?.bluetoothDeviceMonitor.refresh()
+        }
 
-            deviceMonitor.onDeviceConnected = { [weak self] deviceUID, deviceName in
-                self?.handleDeviceConnected(deviceUID, name: deviceName)
-                self?.bluetoothDeviceMonitor.notifyDeviceAppearedInCoreAudio()
-            }
+        deviceMonitor.onDeviceConnected = { [weak self] deviceUID, deviceName in
+            self?.handleDeviceConnected(deviceUID, name: deviceName)
+            self?.bluetoothDeviceMonitor.notifyDeviceAppearedInCoreAudio()
+        }
 
-            deviceMonitor.onInputDeviceDisconnected = { [weak self] deviceUID, deviceName in
-                self?.logger.info("Input device disconnected: \(deviceName) (\(deviceUID))")
-                self?.handleInputDeviceDisconnected(deviceUID)
-            }
+        deviceMonitor.onInputDeviceDisconnected = { [weak self] deviceUID, deviceName in
+            self?.logger.info("Input device disconnected: \(deviceName) (\(deviceUID))")
+            self?.handleInputDeviceDisconnected(deviceUID)
+        }
 
-            deviceMonitor.onInputDeviceConnected = { [weak self] deviceUID, deviceName in
-                self?.logger.info("Input device connected: \(deviceName) (\(deviceUID))")
-                self?.settingsManager.ensureInputDeviceInPriority(deviceUID)
-                self?.handleInputDeviceConnected(deviceUID, name: deviceName)
-            }
+        deviceMonitor.onInputDeviceConnected = { [weak self] deviceUID, deviceName in
+            self?.logger.info("Input device connected: \(deviceName) (\(deviceUID))")
+            self?.settingsManager.ensureInputDeviceInPriority(deviceUID)
+            self?.handleInputDeviceConnected(deviceUID, name: deviceName)
+        }
 
-            deviceVolumeMonitor.onDefaultDeviceChanged = { [weak self] newDefaultUID in
-                self?.handleDefaultDeviceChanged(newDefaultUID)
-            }
+        deviceVolumeMonitor.onDefaultDeviceChanged = { [weak self] newDefaultUID in
+            self?.handleDefaultDeviceChanged(newDefaultUID)
+        }
 
-            deviceVolumeMonitor.onDefaultInputDeviceChanged = { [weak self] newDefaultInputUID in
-                Task { @MainActor [weak self] in
-                    self?.handleDefaultInputDeviceChanged(newDefaultInputUID)
-                }
-            }
-
-            applyPersistedSettings()
-            registerNewDevicesInPriority()
-            // Restore locked input device if feature is enabled
-            if manager.appSettings.lockInputDevice {
-                restoreLockedInputDevice()
+        deviceVolumeMonitor.onDefaultInputDeviceChanged = { [weak self] newDefaultInputUID in
+            Task { @MainActor [weak self] in
+                self?.handleDefaultInputDeviceChanged(newDefaultInputUID)
             }
         }
     }
@@ -282,6 +400,7 @@ final class AudioEngine {
     /// Pinned apps appear first (sorted alphabetically), then unpinned active apps (sorted alphabetically).
     var displayableApps: [DisplayableApp] {
         let activeApps = apps
+            .filter { !settingsManager.isIgnored($0.persistenceIdentifier) }
         let activeIdentifiers = Set(activeApps.map { $0.persistenceIdentifier })
 
         // Get pinned apps that are not currently active
@@ -335,6 +454,38 @@ final class AudioEngine {
         settingsManager.isPinned(identifier)
     }
 
+    // MARK: - Ignored Apps
+
+    /// Hide an active app so FineTune ignores it entirely.
+    func ignoreApp(_ app: AudioApp) {
+        let info = IgnoredAppInfo(
+            persistenceIdentifier: app.persistenceIdentifier,
+            displayName: app.name,
+            bundleID: app.bundleID
+        )
+        settingsManager.ignoreApp(app.persistenceIdentifier, info: info)
+
+        // Tear down the live tap so audio returns to natural volume
+        if let tap = taps.removeValue(forKey: app.id) {
+            tap.invalidate()
+        }
+        appDeviceRouting.removeValue(forKey: app.id)
+        followsDefault.remove(app.id)
+        appliedPIDs.remove(app.id)
+    }
+
+    /// Unhide an app by its persistence identifier.
+    /// Immediately creates a tap if the app is currently running.
+    func unignoreApp(_ identifier: String) {
+        settingsManager.unignoreApp(identifier)
+        applyPersistedSettings()
+    }
+
+    /// Check if an identifier is hidden.
+    func isIgnored(identifier: String) -> Bool {
+        settingsManager.isIgnored(identifier)
+    }
+
     // MARK: - Inactive App Settings (by persistence identifier)
 
     /// Get volume for an inactive app by persistence identifier.
@@ -345,6 +496,14 @@ final class AudioEngine {
     /// Set volume for an inactive app by persistence identifier.
     func setVolumeForInactive(identifier: String, to volume: Float) {
         settingsManager.setVolume(for: identifier, to: volume)
+    }
+
+    func getBoostForInactive(identifier: String) -> BoostLevel {
+        settingsManager.getBoost(for: identifier) ?? .x1
+    }
+
+    func setBoostForInactive(identifier: String, to boost: BoostLevel) {
+        settingsManager.setBoost(for: identifier, to: boost)
     }
 
     /// Get mute state for an inactive app by persistence identifier.
@@ -423,10 +582,14 @@ final class AudioEngine {
 
     func start() {
         // Monitors have internal guards against double-starting
-        processMonitor.start()
+        if permission.status == .authorized {
+            processMonitor.start()
+        }
         deviceMonitor.start()
         applyPersistedSettings()
-        startHealthMonitor()
+        if permission.status == .authorized {
+            startHealthMonitor()
+        }
 
         // Restore locked input device if feature is enabled
         if settingsManager.appSettings.lockInputDevice {
@@ -449,7 +612,12 @@ final class AudioEngine {
 
     /// Rebuilds device lists immediately (used by settings-driven filters).
     func refreshDeviceLists() {
-        deviceMonitor.refreshNow()
+        if let realMonitor = deviceMonitor as? AudioDeviceMonitor {
+            realMonitor.refreshNow()
+        } else {
+            // Fallback for test doubles that only conform to AudioDeviceProviding
+            deviceMonitor.start()
+        }
         registerNewDevicesInPriority()
     }
 
@@ -462,16 +630,63 @@ final class AudioEngine {
         logger.info("AudioEngine shutdown complete")
     }
 
+    // MARK: - Settings Reset
+
+    /// Resets all persisted settings and synchronizes in-memory engine state.
+    /// Active taps are kept alive but reverted to defaults (unity volume, unmuted, flat EQ).
+    func handleSettingsReset() {
+        // 1. Clear persisted state
+        settingsManager.resetAllSettings()
+
+        // 2. Clear in-memory routing and tracking state
+        appliedPIDs.removeAll()
+        appDeviceRouting.removeAll()
+        followsDefault.removeAll()
+
+        // 3. Clear cached per-app audio state
+        volumeState.resetAll()
+
+        // 4. Push defaults to all active taps
+        let defaultVolume = settingsManager.appSettings.defaultNewAppVolume
+        for tap in taps.values {
+            tap.volume = defaultVolume
+            tap.isMuted = false
+            tap.updateEQSettings(.flat)
+            tap.updateAutoEQProfile(nil)
+        }
+
+        // 5. Re-apply from clean settings (re-establishes routing to system default)
+        applyPersistedSettings()
+
+        logger.info("Settings reset: engine state synchronized")
+    }
+
     func setVolume(for app: AudioApp, to volume: Float) {
         volumeState.setVolume(for: app.id, to: volume, identifier: app.persistenceIdentifier)
         if let deviceUID = appDeviceRouting[app.id] {
             ensureTapExists(for: app, deviceUID: deviceUID)
         }
-        taps[app.id]?.volume = volume
+        taps[app.id]?.volume = effectiveVolume(for: app.id)
     }
 
     func getVolume(for app: AudioApp) -> Float {
         volumeState.getVolume(for: app.id)
+    }
+
+    // MARK: - Boost
+
+    func setBoost(for app: AudioApp, to boost: BoostLevel) {
+        volumeState.setBoost(for: app.id, to: boost, identifier: app.persistenceIdentifier)
+        taps[app.id]?.volume = effectiveVolume(for: app.id)
+    }
+
+    func getBoost(for app: AudioApp) -> BoostLevel {
+        volumeState.getBoost(for: app.id)
+    }
+
+    /// Effective gain for ProcessTapController: volume × boost
+    private func effectiveVolume(for pid: pid_t) -> Float {
+        volumeState.getVolume(for: pid) * volumeState.getBoost(for: pid).rawValue
     }
 
     func setMute(for app: AudioApp, to muted: Bool) {
@@ -522,6 +737,17 @@ final class AudioEngine {
         settingsManager.getAutoEQSelection(for: deviceUID)
     }
 
+    var autoEQPreampEnabled: Bool {
+        settingsManager.autoEQPreampEnabled
+    }
+
+    func setAutoEQPreampEnabled(_ enabled: Bool) {
+        settingsManager.autoEQPreampEnabled = enabled
+        for tap in taps.values {
+            tap.setAutoEQPreampEnabled(enabled)
+        }
+    }
+
     /// Apply AutoEQ profile to all taps currently routed to the given device.
     private func applyAutoEQToTaps(for deviceUID: String) {
         for tap in taps.values {
@@ -533,19 +759,24 @@ final class AudioEngine {
     /// Apply the correct AutoEQ profile to a single tap based on its current device.
     /// Skips AutoEQ entirely for devices that don't support it (speakers, HDMI, etc.).
     /// If the profile isn't loaded yet, triggers an async fetch and applies when ready.
-    private func applyAutoEQToTap(_ tap: ProcessTapController) {
+    private func applyAutoEQToTap(_ tap: any ProcessTapControlling) {
         guard let deviceUID = tap.currentDeviceUID else { return }
 
         // Skip AutoEQ for non-headphone devices (or if device not found in monitor)
-        guard let device = deviceMonitor.device(for: deviceUID) else { return }
+        guard let device = deviceMonitor.device(for: deviceUID) else {
+            logger.debug("AutoEQ skip for \(tap.app.name): device \(deviceUID) not found in monitor")
+            return
+        }
         guard device.supportsAutoEQ else {
             tap.updateAutoEQProfile(nil)
+            logger.debug("AutoEQ skip for \(tap.app.name): \(device.name) doesn't support AutoEQ")
             return
         }
 
         guard let selection = settingsManager.getAutoEQSelection(for: deviceUID),
               selection.isEnabled else {
             tap.updateAutoEQProfile(nil)
+            logger.debug("AutoEQ skip for \(tap.app.name): no selection or disabled for \(device.name)")
             return
         }
 
@@ -565,6 +796,21 @@ final class AudioEngine {
         }
     }
 
+    /// Sets the system default output device, routes followsDefault apps, and registers
+    /// an echo so the resulting CoreAudio callback is consumed rather than treated as
+    /// an external change.
+    /// UI code should call this instead of `deviceVolumeMonitor.setDefaultDevice` directly.
+    @discardableResult
+    func setDefaultOutputDevice(_ deviceID: AudioDeviceID) -> Bool {
+        guard deviceVolumeMonitor.setDefaultDevice(deviceID) else { return false }
+        if let uid = deviceMonitor.outputDevices.first(where: { $0.id == deviceID })?.uid {
+            outputEchoTracker.increment(uid)
+            lastConfirmedDefaultUID = uid
+            routeFollowsDefaultApps(to: uid)
+        }
+        return true
+    }
+
     /// Sets the output device for an app.
     /// - Parameters:
     ///   - app: The app to route
@@ -573,9 +819,26 @@ final class AudioEngine {
         if let deviceUID = deviceUID {
             // Explicit device selection - stop following default
             followsDefault.remove(app.id)
+            // Defensive: re-persist routing even if in-memory state matches,
+            // to guard against settings file corruption or incomplete prior writes
+            settingsManager.setDeviceRouting(for: app.persistenceIdentifier, deviceUID: deviceUID)
+
+            // If transitioning from follows-default to explicit and tap has a stream-specific
+            // source, refresh to mixdown so it won't go stale when the default changes later.
+            if let tap = taps[app.id], tap.tapSourceDeviceUID != nil {
+                Task {
+                    do {
+                        try await tap.refreshTapSource(nil)
+                        tap.volume = self.effectiveVolume(for: app.id)
+                        tap.isMuted = self.volumeState.getMute(for: app.id)
+                    } catch {
+                        self.logger.error("Failed to refresh tap source for \(app.name): \(error)")
+                    }
+                }
+            }
+
             guard appDeviceRouting[app.id] != deviceUID else { return }
             appDeviceRouting[app.id] = deviceUID
-            settingsManager.setDeviceRouting(for: app.persistenceIdentifier, deviceUID: deviceUID)
         } else {
             // "System Audio" selected - follow default
             followsDefault.insert(app.id)
@@ -594,13 +857,13 @@ final class AudioEngine {
 
         // Switch tap if needed
         guard let targetUID = appDeviceRouting[app.id] else { return }
-        let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: [targetUID])
+        let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: [targetUID], isFollowsDefault: followsDefault.contains(app.id))
         if let tap = taps[app.id] {
             Task {
                 do {
                     try await tap.switchDevice(to: targetUID, preferredTapSourceDeviceUID: preferredTapSourceUID)
                     // Restore saved volume/mute state after device switch
-                    tap.volume = self.volumeState.getVolume(for: app.id)
+                    tap.volume = self.effectiveVolume(for: app.id)
                     tap.isMuted = self.volumeState.getMute(for: app.id)
                     // Update device volume/mute for VU meter after switch
                     if let device = self.deviceMonitor.device(for: targetUID) {
@@ -697,9 +960,9 @@ final class AudioEngine {
             // Tap exists - update devices
             if tap.currentDeviceUIDs != deviceUIDs {
                 do {
-                    let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: deviceUIDs)
+                    let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: deviceUIDs, isFollowsDefault: followsDefault.contains(app.id))
                     try await tap.updateDevices(to: deviceUIDs, preferredTapSourceDeviceUID: preferredTapSourceUID)
-                    tap.volume = volumeState.getVolume(for: app.id)
+                    tap.volume = effectiveVolume(for: app.id)
                     tap.isMuted = volumeState.getMute(for: app.id)
                     // Update device volume for VU meter (use primary device)
                     if let primaryUID = deviceUIDs.first,
@@ -722,30 +985,27 @@ final class AudioEngine {
     private func ensureTapWithDevices(for app: AudioApp, deviceUIDs: [String]) {
         guard !deviceUIDs.isEmpty else { return }
         guard taps[app.id] == nil else { return }
+        guard permission.status == .authorized else { return }
 
-        let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: deviceUIDs)
-        let tap = ProcessTapController(
-            app: app,
-            targetDeviceUIDs: deviceUIDs,
-            deviceMonitor: deviceMonitor,
-            preferredTapSourceDeviceUID: preferredTapSourceUID
-        )
-        tap.volume = volumeState.getVolume(for: app.id)
-
-        // Set initial device volume/mute for VU meter (use primary device)
-        if let primaryUID = deviceUIDs.first,
-           let device = deviceMonitor.device(for: primaryUID) {
-            tap.currentDeviceVolume = deviceVolumeMonitor.volumes[device.id] ?? 1.0
-            tap.isDeviceMuted = deviceVolumeMonitor.muteStates[device.id] ?? false
-        }
-
+        let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: deviceUIDs, isFollowsDefault: followsDefault.contains(app.id))
         do {
+            let tap = try tapFactory(app, deviceUIDs, preferredTapSourceUID)
+            tap.volume = effectiveVolume(for: app.id)
+
+            // Set initial device volume/mute for VU meter (use primary device)
+            if let primaryUID = deviceUIDs.first,
+               let device = deviceMonitor.device(for: primaryUID) {
+                tap.currentDeviceVolume = deviceVolumeMonitor.volumes[device.id] ?? 1.0
+                tap.isDeviceMuted = deviceVolumeMonitor.muteStates[device.id] ?? false
+            }
+
             try tap.activate()
             taps[app.id] = tap
 
             // Load and apply persisted EQ settings
             let eqSettings = settingsManager.getEQSettings(for: app.persistenceIdentifier)
             tap.updateEQSettings(eqSettings)
+            tap.setAutoEQPreampEnabled(settingsManager.autoEQPreampEnabled)
             applyAutoEQToTap(tap)
 
             logger.debug("Created tap for \(app.name) on \(deviceUIDs.count) device(s)")
@@ -755,16 +1015,19 @@ final class AudioEngine {
     }
 
     func applyPersistedSettings() {
+        guard permission.status == .authorized else { return }
         for app in apps {
             guard !appliedPIDs.contains(app.id) else { continue }
+            guard !settingsManager.isIgnored(app.persistenceIdentifier) else { continue }
 
             // Load saved device selection mode (single vs multi)
             let savedMode = volumeState.loadSavedDeviceSelectionMode(for: app.id, identifier: app.persistenceIdentifier)
             let mode = savedMode ?? .single
 
-            // Load saved volume and mute state
+            // Load saved volume, mute, and boost state
             let savedVolume = volumeState.loadSavedVolume(for: app.id, identifier: app.persistenceIdentifier)
             let savedMute = volumeState.loadSavedMute(for: app.id, identifier: app.persistenceIdentifier)
+            _ = volumeState.loadSavedBoost(for: app.id, identifier: app.persistenceIdentifier)
 
             // Handle multi-device mode
             if mode == .multi {
@@ -783,9 +1046,9 @@ final class AudioEngine {
                         appDeviceRouting[app.id] = availableUIDs[0]
                         appliedPIDs.insert(app.id)
 
-                        // Apply volume and mute
-                        if let volume = savedVolume {
-                            taps[app.id]?.volume = volume
+                        // Apply volume (with boost) and mute
+                        if savedVolume != nil {
+                            taps[app.id]?.volume = effectiveVolume(for: app.id)
                         }
                         if let muted = savedMute, muted {
                             taps[app.id]?.isMuted = true
@@ -826,6 +1089,28 @@ final class AudioEngine {
             }
             appDeviceRouting[app.id] = deviceUID
 
+            // If a tap already exists but is on the wrong device (e.g., app reappeared
+            // after the default changed while it was absent), switch it.
+            if let existingTap = taps[app.id], existingTap.currentDeviceUIDs != [deviceUID] {
+                let preferredSource = preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID], isFollowsDefault: followsDefault.contains(app.id))
+                Task {
+                    do {
+                        try await existingTap.switchDevice(to: deviceUID, preferredTapSourceDeviceUID: preferredSource)
+                        existingTap.volume = self.effectiveVolume(for: app.id)
+                        existingTap.isMuted = self.volumeState.getMute(for: app.id)
+                        if let device = self.deviceMonitor.device(for: deviceUID) {
+                            existingTap.currentDeviceVolume = self.deviceVolumeMonitor.volumes[device.id] ?? 1.0
+                            existingTap.isDeviceMuted = self.deviceVolumeMonitor.muteStates[device.id] ?? false
+                        }
+                        self.applyAutoEQToTap(existingTap)
+                    } catch {
+                        self.logger.error("Failed to re-route \(app.name) to \(deviceUID): \(error.localizedDescription)")
+                    }
+                }
+                appliedPIDs.insert(app.id)
+                continue
+            }
+
             // Always create tap for audio apps (always-on strategy)
             ensureTapExists(for: app, deviceUID: deviceUID)
 
@@ -834,10 +1119,11 @@ final class AudioEngine {
             guard taps[app.id] != nil else { continue }
             appliedPIDs.insert(app.id)
 
-            if let volume = savedVolume {
-                let displayPercent = Int(VolumeMapping.gainToSlider(volume) * 200)
-                logger.debug("Applying saved volume \(displayPercent)% to \(app.name)")
-                taps[app.id]?.volume = volume
+            if savedVolume != nil {
+                let effective = effectiveVolume(for: app.id)
+                let displayPercent = Int(effective * 100)
+                logger.debug("Applying saved volume \(displayPercent)% (with boost) to \(app.name)")
+                taps[app.id]?.volume = effective
             }
 
             if let muted = savedMute, muted {
@@ -849,34 +1135,49 @@ final class AudioEngine {
 
     private func ensureTapExists(for app: AudioApp, deviceUID: String) {
         guard taps[app.id] == nil else { return }
+        guard permission.status == .authorized else { return }
 
-        let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID])
-        let tap = ProcessTapController(
-            app: app,
-            targetDeviceUID: deviceUID,
-            deviceMonitor: deviceMonitor,
-            preferredTapSourceDeviceUID: preferredTapSourceUID
-        )
-        tap.volume = volumeState.getVolume(for: app.id)
-
-        // Set initial device volume/mute for VU meter accuracy
-        if let device = deviceMonitor.device(for: deviceUID) {
-            tap.currentDeviceVolume = deviceVolumeMonitor.volumes[device.id] ?? 1.0
-            tap.isDeviceMuted = deviceVolumeMonitor.muteStates[device.id] ?? false
-        }
-
+        let preferredTapSourceUID = preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID], isFollowsDefault: followsDefault.contains(app.id))
         do {
+            let tap = try tapFactory(app, [deviceUID], preferredTapSourceUID)
+            tap.volume = effectiveVolume(for: app.id)
+
+            // Set initial device volume/mute for VU meter accuracy
+            if let device = deviceMonitor.device(for: deviceUID) {
+                tap.currentDeviceVolume = deviceVolumeMonitor.volumes[device.id] ?? 1.0
+                tap.isDeviceMuted = deviceVolumeMonitor.muteStates[device.id] ?? false
+            }
+
             try tap.activate()
             taps[app.id] = tap
 
             // Load and apply persisted EQ settings
             let eqSettings = settingsManager.getEQSettings(for: app.persistenceIdentifier)
             tap.updateEQSettings(eqSettings)
+            tap.setAutoEQPreampEnabled(settingsManager.autoEQPreampEnabled)
             applyAutoEQToTap(tap)
 
             logger.debug("Created tap for \(app.name)")
         } catch {
             logger.error("Failed to create tap for \(app.name): \(error.localizedDescription)")
+        }
+    }
+
+    /// Restores the default to `lastConfirmedDefaultUID` (what the user/FineTune intended).
+    /// Falls back to highest-priority device if the confirmed device is gone.
+    private func restoreConfirmedDefault() {
+        if let restoreUID = lastConfirmedDefaultUID,
+           let device = deviceMonitor.device(for: restoreUID),
+           isAliveCheck(device.id) {
+            if deviceVolumeMonitor.defaultDeviceUID != restoreUID {
+                if deviceVolumeMonitor.setDefaultDevice(device.id) {
+                    outputEchoTracker.increment(restoreUID)
+                    logger.info("Restored default → \(device.name)")
+                }
+            }
+            routeFollowsDefaultApps(to: restoreUID)
+        } else {
+            reEvaluateOutputDefault()
         }
     }
 
@@ -888,7 +1189,8 @@ final class AudioEngine {
         guard let target = Self.resolveHighestPriority(
             priorityOrder: settingsManager.devicePriorityOrder,
             connectedDevices: outputDevices,
-            excluding: excluding
+            excluding: excluding,
+            isAlive: isAliveCheck
         ) else { return nil }
 
         let currentDefault = deviceVolumeMonitor.defaultDeviceUID
@@ -899,6 +1201,7 @@ final class AudioEngine {
             }
         }
 
+        lastConfirmedDefaultUID = target.uid
         routeFollowsDefaultApps(to: target.uid)
         return target.uid
     }
@@ -910,7 +1213,8 @@ final class AudioEngine {
         guard let target = Self.resolveHighestPriority(
             priorityOrder: settingsManager.inputDevicePriorityOrder,
             connectedDevices: inputDevices,
-            excluding: excluding
+            excluding: excluding,
+            isAlive: isAliveCheck
         ) else { return nil }
 
         if target.uid != deviceVolumeMonitor.defaultInputDeviceUID {
@@ -931,7 +1235,7 @@ final class AudioEngine {
             appDeviceRouting[pid] = targetUID
         }
 
-        var tapsToSwitch: [(app: AudioApp, tap: ProcessTapController)] = []
+        var tapsToSwitch: [(app: AudioApp, tap: any ProcessTapControlling)] = []
         for app in apps {
             guard followsDefault.contains(app.id), let tap = taps[app.id] else { continue }
             tapsToSwitch.append((app, tap))
@@ -941,8 +1245,9 @@ final class AudioEngine {
         Task {
             for (app, tap) in tapsToSwitch {
                 do {
-                    try await tap.switchDevice(to: targetUID, preferredTapSourceDeviceUID: targetUID)
-                    tap.volume = self.volumeState.getVolume(for: app.id)
+                    let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: [targetUID], isFollowsDefault: true)
+                    try await tap.switchDevice(to: targetUID, preferredTapSourceDeviceUID: preferredTapSourceUID)
+                    tap.volume = self.effectiveVolume(for: app.id)
                     tap.isMuted = self.volumeState.getMute(for: app.id)
                     if let device = self.deviceMonitor.device(for: targetUID) {
                         tap.currentDeviceVolume = self.deviceVolumeMonitor.volumes[device.id] ?? 1.0
@@ -958,6 +1263,9 @@ final class AudioEngine {
 
     /// Called when device disappears - updates routing and switches taps immediately
     private func handleDeviceDisconnected(_ deviceUID: String, name deviceName: String) {
+        // Clean up alive watcher — use UID lookup since device is already removed from monitor
+        removeAliveWatcher(forUID: deviceUID)
+
         // If we were waiting for macOS to auto-switch to this device, cancel — it's gone
         if case .pendingAutoSwitch(let uid, let task) = outputPriorityState, uid == deviceUID {
             task.cancel()
@@ -971,12 +1279,13 @@ final class AudioEngine {
         let fallbackDevice = Self.resolveHighestPriority(
             priorityOrder: settingsManager.devicePriorityOrder,
             connectedDevices: outputDevices,
-            excluding: deviceUID
+            excluding: deviceUID,
+            isAlive: isAliveCheck
         )
 
         var affectedApps: [AudioApp] = []
-        var singleModeTapsToSwitch: [(tap: ProcessTapController, fallbackUID: String)] = []
-        var multiModeTapsToUpdate: [(tap: ProcessTapController, remainingUIDs: [String])] = []
+        var singleModeTapsToSwitch: [(tap: any ProcessTapControlling, fallbackUID: String)] = []
+        var multiModeTapsToUpdate: [(tap: any ProcessTapControlling, remainingUIDs: [String])] = []
 
         // Iterate over taps instead of apps - apps list may be empty if disconnected device
         // was the system default (CoreAudio removes app from process list when output disappears)
@@ -1018,12 +1327,12 @@ final class AudioEngine {
         // Execute device switches
         if !singleModeTapsToSwitch.isEmpty || !multiModeTapsToUpdate.isEmpty {
             Task {
-                // Handle single-mode switches
+                // Handle single-mode switches — source device is dead, skip crossfade
                 for (tap, fallbackUID) in singleModeTapsToSwitch {
                     do {
-                        let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: [fallbackUID])
-                        try await tap.switchDevice(to: fallbackUID, preferredTapSourceDeviceUID: preferredTapSourceUID)
-                        tap.volume = self.volumeState.getVolume(for: tap.app.id)
+                        let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: [fallbackUID], isFollowsDefault: true)
+                        try await tap.switchDevice(to: fallbackUID, preferredTapSourceDeviceUID: preferredTapSourceUID, sourceDeviceDead: true)
+                        tap.volume = self.effectiveVolume(for: tap.app.id)
                         tap.isMuted = self.volumeState.getMute(for: tap.app.id)
                         self.applyAutoEQToTap(tap)
                     } catch {
@@ -1032,11 +1341,12 @@ final class AudioEngine {
                 }
 
                 // Handle multi-mode updates (remove disconnected device from aggregate)
+                // Source device is dead, skip crossfade
                 for (tap, remainingUIDs) in multiModeTapsToUpdate {
                     do {
-                        let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: remainingUIDs)
-                        try await tap.updateDevices(to: remainingUIDs, preferredTapSourceDeviceUID: preferredTapSourceUID)
-                        tap.volume = self.volumeState.getVolume(for: tap.app.id)
+                        let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: remainingUIDs, isFollowsDefault: self.followsDefault.contains(tap.app.id))
+                        try await tap.updateDevices(to: remainingUIDs, preferredTapSourceDeviceUID: preferredTapSourceUID, sourceDeviceDead: true)
+                        tap.volume = self.effectiveVolume(for: tap.app.id)
                         tap.isMuted = self.volumeState.getMute(for: tap.app.id)
                         self.logger.debug("Removed \(deviceName) from \(tap.app.name) multi-device output")
                     } catch {
@@ -1066,7 +1376,7 @@ final class AudioEngine {
         settingsManager.ensureDeviceInPriority(deviceUID)
 
         var affectedApps: [AudioApp] = []
-        var tapsToSwitch: [ProcessTapController] = []
+        var tapsToSwitch: [any ProcessTapControlling] = []
 
         // Iterate over taps for consistency with handleDeviceDisconnected
         for tap in taps.values {
@@ -1094,9 +1404,9 @@ final class AudioEngine {
             Task {
                 for tap in tapsToSwitch {
                     do {
-                        let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID])
+                        let preferredTapSourceUID = self.preferredTapSourceDeviceUID(forOutputUIDs: [deviceUID], isFollowsDefault: false)
                         try await tap.switchDevice(to: deviceUID, preferredTapSourceDeviceUID: preferredTapSourceUID)
-                        tap.volume = self.volumeState.getVolume(for: tap.app.id)
+                        tap.volume = self.effectiveVolume(for: tap.app.id)
                         tap.isMuted = self.volumeState.getMute(for: tap.app.id)
                         if let device = self.deviceMonitor.device(for: deviceUID) {
                             tap.currentDeviceVolume = self.deviceVolumeMonitor.volumes[device.id] ?? 1.0
@@ -1111,7 +1421,7 @@ final class AudioEngine {
         }
 
         // Second pass: restore multi-device apps that had this device in their selection
-        var multiModeTapsToUpdate: [ProcessTapController] = []
+        var multiModeTapsToUpdate: [any ProcessTapControlling] = []
         for tap in taps.values {
             let app = tap.app
             guard settingsManager.getDeviceSelectionMode(for: app.persistenceIdentifier) == .multi else { continue }
@@ -1143,44 +1453,123 @@ final class AudioEngine {
             }
         }
 
-        // Enforce priority-based system default
-        guard let target = Self.resolveHighestPriority(
-            priorityOrder: settingsManager.devicePriorityOrder,
-            connectedDevices: outputDevices
-        ) else { return }
-
+        // Only override the default if the newly connected device IS the highest-priority
+        // device (i.e., a higher-priority device just came back). If a lower-priority device
+        // connects while the user is on a higher-priority device, respect the current default —
+        // the user chose it. We still enter PENDING_AUTOSWITCH to guard against macOS
+        // auto-switching to the new device.
         let currentDefault = deviceVolumeMonitor.defaultDeviceUID
+        let isNewDeviceHigherPriority = (deviceUID == Self.resolveHighestPriority(
+            priorityOrder: settingsManager.devicePriorityOrder,
+            connectedDevices: outputDevices,
+            isAlive: isAliveCheck
+        )?.uid)
 
-        if target.uid != currentDefault {
-            // Highest-priority device isn't the current default — switch immediately
-            reEvaluateOutputDefault()
-        } else {
-            // Highest-priority device IS the current default, but macOS may auto-switch
-            // to the newly connected device shortly. Enter PENDING_AUTOSWITCH to catch it.
-            if case .pendingAutoSwitch(_, let oldTask) = outputPriorityState {
-                oldTask.cancel()
-                outputPriorityState = .stable
-                reEvaluateOutputDefault()
-            }
-
-            let transport = deviceMonitor.device(for: deviceUID)?.id.readTransportType()
-            let timeout = (transport == .bluetooth || transport == .bluetoothLE)
-                ? btAutoSwitchGracePeriod
-                : autoSwitchGracePeriod
-
-            let timeoutTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .seconds(timeout))
-                guard let self, !Task.isCancelled else { return }
-                self.outputPriorityState = .stable
-                self.logger.debug("Auto-switch grace period expired, no macOS switch detected")
-            }
-
-            outputPriorityState = .pendingAutoSwitch(
-                connectedDeviceUID: deviceUID,
-                timeoutTask: timeoutTask
-            )
-            logger.debug("Entered PENDING_AUTOSWITCH for \(deviceName) (\(timeout)s grace)")
+        // If this device is present but not alive, watch for it to become alive
+        if let device = deviceMonitor.device(for: deviceUID),
+           !isAliveCheck(device.id) {
+            installAliveWatcher(deviceID: device.id, uid: deviceUID, name: deviceName)
         }
+
+        if isNewDeviceHigherPriority, deviceUID != currentDefault {
+            // A higher-priority device reconnected — switch to it
+            reEvaluateOutputDefault()
+        } else if !isNewDeviceHigherPriority, currentDefault == deviceUID {
+            // macOS already auto-switched to the lower-priority device — restore
+            // what the user was on (not highest priority — they may have chosen a mid-priority device)
+            restoreConfirmedDefault()
+        }
+
+        // Cancel any existing PENDING_AUTOSWITCH before entering a new one.
+        if case .pendingAutoSwitch(_, let oldTask) = outputPriorityState {
+            oldTask.cancel()
+            outputPriorityState = .stable
+        }
+
+        // Always enter PENDING_AUTOSWITCH for the newly connected device.
+        // macOS may auto-switch to it multiple times during BT firmware handshake.
+        // Without this grace period, auto-switches would be treated as "genuine user change".
+        let transport = deviceMonitor.device(for: deviceUID)?.id.readTransportType()
+        let timeout = (transport == .bluetooth || transport == .bluetoothLE)
+            ? btAutoSwitchGracePeriod
+            : autoSwitchGracePeriod
+
+        let timeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(timeout))
+            guard let self, !Task.isCancelled else { return }
+            self.outputPriorityState = .stable
+            self.logger.debug("Auto-switch grace period expired, no macOS switch detected")
+        }
+
+        lastAutoSwitchOverrideTime = nil
+        outputPriorityState = .pendingAutoSwitch(
+            connectedDeviceUID: deviceUID,
+            timeoutTask: timeoutTask
+        )
+        logger.debug("Entered PENDING_AUTOSWITCH for \(deviceName) (\(timeout)s grace)")
+    }
+
+    // MARK: - Alive Watchers
+
+    /// Installs a one-shot HAL listener for kAudioDevicePropertyDeviceIsAlive on a device
+    /// that is present but not yet alive. When the device becomes alive, re-runs
+    /// handleDeviceConnected so priority is re-evaluated. Self-removes after firing or timeout.
+    private func installAliveWatcher(deviceID: AudioDeviceID, uid: String, name: String) {
+        guard aliveWatchers[deviceID] == nil else { return }
+
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsAlive,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+
+        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.isAliveCheck(deviceID) else { return }
+                self.logger.info("Device became alive: \(name) (\(uid)), re-evaluating priority")
+                self.removeAliveWatcher(deviceID)
+                self.handleDeviceConnected(uid, name: name)
+            }
+        }
+
+        let status = AudioObjectAddPropertyListenerBlock(deviceID, &address, .main, block)
+        guard status == noErr else {
+            logger.warning("Failed to install alive watcher for \(name) (\(deviceID)): \(status)")
+            return
+        }
+
+        let timeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(30))
+            guard let self, !Task.isCancelled else { return }
+            self.logger.debug("Alive watcher timed out for \(name) (\(uid))")
+            self.removeAliveWatcher(deviceID)
+        }
+
+        aliveWatchers[deviceID] = (uid: uid, block: block, timeout: timeoutTask)
+        logger.debug("Installed alive watcher for \(name) (\(uid))")
+    }
+
+    /// Removes a one-shot alive watcher by device ID, cleaning up the HAL listener and timeout.
+    private func removeAliveWatcher(_ deviceID: AudioDeviceID) {
+        guard let watcher = aliveWatchers.removeValue(forKey: deviceID) else { return }
+        watcher.timeout.cancel()
+
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyDeviceIsAlive,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        let status = AudioObjectRemovePropertyListenerBlock(deviceID, &address, .main, watcher.block)
+        if status != noErr && status != OSStatus(kAudioHardwareBadObjectError) {
+            logger.warning("Failed to remove alive watcher for device \(deviceID): \(status)")
+        }
+    }
+
+    /// Removes a one-shot alive watcher by device UID. Used during disconnect when the
+    /// device is already removed from the monitor's list and device(for:) returns nil.
+    private func removeAliveWatcher(forUID uid: String) {
+        guard let (deviceID, _) = aliveWatchers.first(where: { $0.value.uid == uid }) else { return }
+        removeAliveWatcher(deviceID)
     }
 
     private func showReconnectNotification(deviceName: String, affectedApps: [AudioApp]) {
@@ -1226,12 +1615,34 @@ final class AudioEngine {
         // State machine: if we're waiting for macOS to auto-switch after a device connect,
         // check whether this change is the expected auto-switch or user intent.
         if case .pendingAutoSwitch(let pendingUID, let timeoutTask) = outputPriorityState {
+            // Check echoes FIRST — FineTune's own changes (UI, restoreConfirmedDefault)
+            // create echoes. Consuming before Case 1 ensures FineTune UI changes aren't
+            // mistaken for macOS auto-switches.
+            if outputEchoTracker.consume(newDefaultUID) {
+                return
+            }
+
             if newDefaultUID == pendingUID {
-                // Case 1: macOS auto-switched to the newly connected device — override to priority.
-                // Re-enter PENDING_AUTOSWITCH because macOS may auto-switch multiple times
-                // (common with Bluetooth devices during firmware handshake).
+                // Settling heuristic: if >1s since last override, BT auto-switches have
+                // settled. This is likely the user changing via System Settings — accept it.
+                // BT auto-switches happen within ms; user actions take >1s.
+                if let lastOverride = lastAutoSwitchOverrideTime,
+                   Date().timeIntervalSince(lastOverride) > 1.0 {
+                    timeoutTask.cancel()
+                    outputPriorityState = .stable
+                    lastConfirmedDefaultUID = newDefaultUID
+                    lastAutoSwitchOverrideTime = nil
+                    routeFollowsDefaultApps(to: newDefaultUID)
+                    let deviceName = deviceMonitor.device(for: newDefaultUID)?.name ?? newDefaultUID
+                    logger.info("Accepted user change to \(deviceName) (settled >1s)")
+                    return
+                }
+
+                // Case 1: macOS auto-switched to the newly connected device — restore what
+                // the user was on. Re-enter PENDING_AUTOSWITCH for further auto-switches.
                 timeoutTask.cancel()
-                reEvaluateOutputDefault()
+                restoreConfirmedDefault()
+                lastAutoSwitchOverrideTime = Date()
                 let transport = deviceMonitor.device(for: pendingUID)?.id.readTransportType()
                 let timeout = (transport == .bluetooth || transport == .bluetoothLE)
                     ? btAutoSwitchGracePeriod
@@ -1240,6 +1651,7 @@ final class AudioEngine {
                     try? await Task.sleep(for: .seconds(timeout))
                     guard let self, !Task.isCancelled else { return }
                     self.outputPriorityState = .stable
+                    self.lastAutoSwitchOverrideTime = nil
                     self.logger.debug("Auto-switch grace period expired after override")
                 }
                 outputPriorityState = .pendingAutoSwitch(
@@ -1248,14 +1660,11 @@ final class AudioEngine {
                 )
                 return
             }
-            // Case 2: Our own echo from the override (e.g. speakers becoming default).
-            // Consume it without disrupting the state machine — macOS may still auto-switch again.
-            if outputEchoTracker.consume(newDefaultUID) {
-                return
-            }
+
             // Case 3: Genuine user intent (different device, not our echo) — respect it.
             timeoutTask.cancel()
             outputPriorityState = .stable
+            lastAutoSwitchOverrideTime = nil
         }
 
         // Suppress echo from our own priority-based override (when not in pendingAutoSwitch)
@@ -1269,15 +1678,22 @@ final class AudioEngine {
             return
         }
 
-        // Check if the new default device is alive. If it's dead, override to priority fallback.
-        // If it's alive, this is a genuine user change — respect it even if a higher-priority device exists.
-        let newDeviceIsAlive = deviceMonitor.device(for: newDefaultUID)?.id.isDeviceAlive() ?? false
+        // Check if the new default device is known and alive.
+        guard let newDevice = deviceMonitor.device(for: newDefaultUID) else {
+            // Device not yet in monitor's list (e.g., BT device default-changed before device-list
+            // notification). Defer — the upcoming handleDeviceConnected will enforce priority.
+            logger.debug("Default changed to unknown device \(newDefaultUID), deferring to device list refresh")
+            return
+        }
+
+        let newDeviceIsAlive = isAliveCheck(newDevice.id)
 
         if !newDeviceIsAlive {
             // Dead device became default (race with disconnect) — override to priority fallback
             reEvaluateOutputDefault()
         } else {
             // Genuine change to a live device — route followsDefault apps
+            lastConfirmedDefaultUID = newDefaultUID
             routeFollowsDefaultApps(to: newDefaultUID)
 
             let affectedApps = apps.filter { followsDefault.contains($0.id) }
@@ -1310,10 +1726,12 @@ final class AudioEngine {
         }
     }
 
-    /// Returns the device UID to use for stream-specific tap capture.
-    /// Only use stream-specific taping when the selected outputs include the current system default;
-    /// otherwise fall back to stereo mixdown to avoid tapping the wrong device stream.
-    private func preferredTapSourceDeviceUID(forOutputUIDs outputUIDs: [String]) -> String? {
+    /// Returns the preferred tap source device UID for stream-specific capture.
+    /// Only follows-default apps use stream-specific taps (multichannel preserved, tap always
+    /// valid because the app switches device when default changes). Explicitly-routed apps
+    /// always use stereo mixdown (nil) — their tap never goes stale when the default changes.
+    private func preferredTapSourceDeviceUID(forOutputUIDs outputUIDs: [String], isFollowsDefault: Bool) -> String? {
+        guard isFollowsDefault else { return nil }
         guard let defaultUID = deviceVolumeMonitor.defaultDeviceUID else { return nil }
         return outputUIDs.contains(defaultUID) ? defaultUID : nil
     }
@@ -1324,6 +1742,7 @@ final class AudioEngine {
 
         // Cancel cleanup for PIDs that reappeared — but only if bundleID matches.
         // PID reuse by a different app should not rescue the old tap.
+
         for pid in activePIDs {
             guard let task = pendingCleanup[pid] else { continue }
 
@@ -1339,6 +1758,12 @@ final class AudioEngine {
 
             pendingCleanup.removeValue(forKey: pid)
             task.cancel()
+            // Don't remove from appliedPIDs — the tap is still alive and the aggregate
+            // device is still running. The process just transiently stopped audio I/O
+            // during a device change (kAudioProcessPropertyIsRunning flicker).
+            // Device routing is already handled by routeFollowsDefaultApps (follows-default)
+            // or stays put (explicit routing). Re-processing would cause an unnecessary
+            // crossfade that interrupts audio.
             logger.debug("Cancelled pending cleanup for PID \(pid) - app reappeared")
         }
 
@@ -1363,8 +1788,7 @@ final class AudioEngine {
                     self.logger.debug("Cleaned up stale tap for PID \(pid)")
                 }
                 self.appDeviceRouting.removeValue(forKey: pid)
-                self.followsDefault.remove(pid)
-                self.appliedPIDs.remove(pid)  // Allow re-initialization if app resumes
+                self.followsDefault.remove(pid)  // Allow re-initialization if app resumes
                 self.pendingCleanup.removeValue(forKey: pid)
             }
         }
@@ -1398,6 +1822,9 @@ final class AudioEngine {
                 try? await Task.sleep(for: .seconds(2))
                 guard !Task.isCancelled, let self else { return }
 
+                // Skip entirely when no taps exist — avoids unnecessary work at idle (#176)
+                guard !self.taps.isEmpty else { continue }
+
                 let now = Date()
 
                 for (pid, tap) in self.taps {
@@ -1428,7 +1855,7 @@ final class AudioEngine {
                         if misses >= 3 {
                             self.logger.warning("Tap for PID \(pid) unresponsive (\(misses) misses), recreating")
                             consecutiveMisses[pid] = 0
-                            self.recreateTap(for: pid)
+                            await self.recreateTap(for: pid)
                         }
                     }
                 }
@@ -1446,10 +1873,12 @@ final class AudioEngine {
     }
 
     /// Tears down and recreates a tap for a given PID, preserving routing and settings.
-    private func recreateTap(for pid: pid_t) {
+    /// Async: awaits full CoreAudio resource teardown before creating the replacement tap
+    /// to prevent orphaned IO procs from accumulating (issue #176).
+    private func recreateTap(for pid: pid_t) async {
         guard let oldTap = taps.removeValue(forKey: pid) else { return }
         let deviceUIDs = oldTap.currentDeviceUIDs
-        oldTap.invalidate()
+        await oldTap.invalidateAsync()
 
         // Set cooldown to prevent thrashing
         tapRecoveryCooldownUntil[pid] = Date().addingTimeInterval(20)
@@ -1494,13 +1923,10 @@ final class AudioEngine {
         // check whether this change is the expected auto-switch or user intent.
         if case .pendingAutoSwitch(let pendingUID, let timeoutTask) = inputPriorityState {
             if newDefaultInputUID == pendingUID, settingsManager.appSettings.lockInputDevice {
-                // Case 1: macOS auto-switched to the newly connected device — override to priority.
+                // Case 1: macOS auto-switched to the newly connected device — restore locked device.
                 // Re-enter PENDING_AUTOSWITCH because macOS may auto-switch multiple times.
                 timeoutTask.cancel()
-                let resolvedUID = reEvaluateInputDefault()
-                if let resolvedUID {
-                    settingsManager.setLockedInputDeviceUID(resolvedUID)
-                }
+                restoreLockedInputDevice()
                 let transport = deviceMonitor.inputDevice(for: pendingUID)?.id.readTransportType()
                 let timeout = (transport == .bluetooth || transport == .bluetoothLE)
                     ? btAutoSwitchGracePeriod
@@ -1540,20 +1966,12 @@ final class AudioEngine {
         // If lock is disabled, let system control input freely
         guard settingsManager.appSettings.lockInputDevice else { return }
 
-        // resolve() handles dead-device fallback automatically
-        guard let target = Self.resolveHighestPriority(
-            priorityOrder: settingsManager.inputDevicePriorityOrder,
-            connectedDevices: inputDevices
-        ) else { return }
-
-        if target.uid != newDefaultInputUID {
-            // Current default doesn't match priority — override
-            reEvaluateInputDefault()
-            settingsManager.setLockedInputDeviceUID(target.uid)
-        } else {
-            // Genuine change that matches priority — update the lock
-            logger.info("User changed input device to: \(newDefaultInputUID) - updating lock")
-            settingsManager.setLockedInputDeviceUID(newDefaultInputUID)
+        // Restore the locked device — any change outside FineTune's UI is either
+        // macOS auto-switch or System Settings, and the lock should hold either way.
+        // Users change the lock via FineTune's UI (setLockedInputDevice).
+        guard let lockedUID = settingsManager.lockedInputDeviceUID else { return }
+        if newDefaultInputUID != lockedUID {
+            restoreLockedInputDevice()
         }
     }
 
@@ -1576,6 +1994,7 @@ final class AudioEngine {
     }
 
     /// Locks the input device to the built-in microphone.
+    /// This is a fallback — does NOT update preferredInputDeviceUID.
     private func lockToBuiltInMicrophone() {
         guard let builtInMic = deviceMonitor.inputDevices.first(where: {
             $0.id.readTransportType() == .builtIn
@@ -1584,7 +2003,29 @@ final class AudioEngine {
             return
         }
 
-        setLockedInputDevice(builtInMic)
+        applyInputDeviceLock(builtInMic)
+    }
+
+    /// Applies input device lock without changing the user's preferred device.
+    /// Used for fallback scenarios (disconnect, built-in mic recovery).
+    private func applyInputDeviceLock(_ device: AudioDevice) {
+        logger.info("Locking input device to: \(device.name)")
+        settingsManager.setLockedInputDeviceUID(device.uid)
+        if deviceVolumeMonitor.setDefaultInputDevice(device.id) {
+            inputEchoTracker.increment(device.uid)
+        }
+    }
+
+    /// Called when the user toggles lockInputDevice ON in settings.
+    /// Captures the current default input device as the locked and preferred device.
+    func handleInputLockEnabled() {
+        guard let currentUID = deviceVolumeMonitor.defaultInputDeviceUID,
+              let device = deviceMonitor.inputDevice(for: currentUID) else {
+            return
+        }
+        logger.info("Input lock enabled, locking to current default: \(device.name)")
+        settingsManager.setLockedInputDeviceUID(device.uid)
+        settingsManager.setPreferredInputDeviceUID(device.uid)
     }
 
     /// Called when user explicitly selects an input device (via FineTune UI).
@@ -1592,8 +2033,9 @@ final class AudioEngine {
     func setLockedInputDevice(_ device: AudioDevice) {
         logger.info("User locked input device to: \(device.name)")
 
-        // Persist the choice
+        // Persist the choice — both current lock and preferred (user intent)
         settingsManager.setLockedInputDeviceUID(device.uid)
+        settingsManager.setPreferredInputDeviceUID(device.uid)
 
         // Apply the change
         if deviceVolumeMonitor.setDefaultInputDevice(device.id) {
@@ -1601,43 +2043,45 @@ final class AudioEngine {
         }
     }
 
-    /// Called when an input device connects — enforces priority via state machine.
+    /// Called when an input device connects — restores locked/preferred device and guards against auto-switch.
     private func handleInputDeviceConnected(_ deviceUID: String, name deviceName: String) {
         guard settingsManager.appSettings.lockInputDevice else { return }
 
-        guard let target = Self.resolveHighestPriority(
-            priorityOrder: settingsManager.inputDevicePriorityOrder,
-            connectedDevices: inputDevices
-        ) else { return }
-
-        let currentDefault = deviceVolumeMonitor.defaultInputDeviceUID
-
-        if target.uid != currentDefault {
-            reEvaluateInputDefault()
-        } else {
-            // macOS may auto-switch to the new device. Enter PENDING_AUTOSWITCH.
-            if case .pendingAutoSwitch(_, let oldTask) = inputPriorityState {
-                oldTask.cancel()
-                inputPriorityState = .stable
-                reEvaluateInputDefault()
-            }
-
-            let transport = deviceMonitor.inputDevice(for: deviceUID)?.id.readTransportType()
-            let timeout = (transport == .bluetooth || transport == .bluetoothLE)
-                ? btAutoSwitchGracePeriod
-                : autoSwitchGracePeriod
-
-            let timeoutTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .seconds(timeout))
-                guard let self, !Task.isCancelled else { return }
-                self.inputPriorityState = .stable
-            }
-
-            inputPriorityState = .pendingAutoSwitch(
-                connectedDeviceUID: deviceUID,
-                timeoutTask: timeoutTask
-            )
+        // If the reconnected device is the user's preferred device, restore the lock to it
+        if let preferredUID = settingsManager.preferredInputDeviceUID,
+           deviceUID == preferredUID,
+           settingsManager.lockedInputDeviceUID != preferredUID,
+           let device = deviceMonitor.inputDevice(for: deviceUID) {
+            logger.info("Preferred input device reconnected: \(deviceName), restoring lock")
+            settingsManager.setLockedInputDeviceUID(device.uid)
         }
+
+        // Restore the user's locked device (not priority-based — lock overrides priority)
+        restoreLockedInputDevice()
+
+        // Cancel any existing PENDING_AUTOSWITCH before entering a new one
+        if case .pendingAutoSwitch(_, let oldTask) = inputPriorityState {
+            oldTask.cancel()
+        }
+
+        // Always enter PENDING_AUTOSWITCH — macOS may auto-switch to the newly connected
+        // device multiple times during BT handshake, even if we just restored the lock.
+        let transport = deviceMonitor.inputDevice(for: deviceUID)?.id.readTransportType()
+        let timeout = (transport == .bluetooth || transport == .bluetoothLE)
+            ? btAutoSwitchGracePeriod
+            : autoSwitchGracePeriod
+
+        let timeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(timeout))
+            guard let self, !Task.isCancelled else { return }
+            self.inputPriorityState = .stable
+            self.logger.debug("Input auto-switch grace period expired, no macOS switch detected")
+        }
+
+        inputPriorityState = .pendingAutoSwitch(
+            connectedDeviceUID: deviceUID,
+            timeoutTask: timeoutTask
+        )
     }
 
     /// Handles input device disconnect — uses priority fallback, then built-in mic.
@@ -1654,7 +2098,8 @@ final class AudioEngine {
         let priorityFallback = Self.resolveHighestPriority(
             priorityOrder: settingsManager.inputDevicePriorityOrder,
             connectedDevices: inputDevices,
-            excluding: deviceUID
+            excluding: deviceUID,
+            isAlive: isAliveCheck
         )
 
         // If the disconnected device was the default input, override to priority fallback
@@ -1672,7 +2117,7 @@ final class AudioEngine {
                 // Default already switched above, just update the lock setting
                 settingsManager.setLockedInputDeviceUID(fallbackDevice.uid)
             } else {
-                setLockedInputDevice(fallbackDevice)
+                applyInputDeviceLock(fallbackDevice)
             }
         } else {
             logger.info("Locked input device disconnected, falling back to built-in mic")
@@ -1680,3 +2125,7 @@ final class AudioEngine {
         }
     }
 }
+
+// MARK: - URLHandlerEngine Conformance
+
+extension AudioEngine: URLHandlerEngine {}

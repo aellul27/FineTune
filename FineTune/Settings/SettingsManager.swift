@@ -11,6 +11,14 @@ struct PinnedAppInfo: Codable, Equatable {
     let bundleID: String?
 }
 
+// MARK: - Ignored App Info
+
+struct IgnoredAppInfo: Codable, Equatable {
+    let persistenceIdentifier: String
+    let displayName: String
+    let bundleID: String?
+}
+
 // MARK: - App-Wide Settings Enums
 
 enum MenuBarIconStyle: String, Codable, CaseIterable, Identifiable {
@@ -73,14 +81,18 @@ final class SettingsManager {
         var appVolumes: [String: Float] = [:]
         var appDeviceRouting: [String: String] = [:]  // bundleID → deviceUID
         var appMutes: [String: Bool] = [:]  // bundleID → isMuted
+        var appBoosts: [String: Float] = [:]  // bundleID → boost rawValue (1.0, 2.0, 3.0, 4.0)
         var appEQSettings: [String: EQSettings] = [:]  // bundleID → EQ settings
         var appSettings: AppSettings = AppSettings()  // App-wide settings
         var systemSoundsFollowsDefault: Bool = true  // Whether system sounds follows macOS default
         var appDeviceSelectionMode: [String: DeviceSelectionMode] = [:]  // bundleID → selection mode
         var appSelectedDeviceUIDs: [String: [String]] = [:]  // bundleID → array of device UIDs for multi mode
-        var lockedInputDeviceUID: String? = nil  // User's preferred input device (for input lock feature)
+        var lockedInputDeviceUID: String? = nil  // Current locked input device (updated on fallback)
+        var preferredInputDeviceUID: String? = nil  // User's intended input device (survives disconnect)
         var pinnedApps: Set<String> = []  // Persistence identifiers of pinned apps
         var pinnedAppInfo: [String: PinnedAppInfo] = [:]  // Persistence identifier → app metadata
+        var ignoredApps: Set<String> = []  // Persistence identifiers of hidden apps
+        var ignoredAppInfo: [String: IgnoredAppInfo] = [:]  // Persistence identifier → app metadata
 
         // DDC monitor speaker volumes (keyed by CoreAudio device UID for stability across reboots)
         var ddcVolumes: [String: Int] = [:]       // device UID → volume (0-100)
@@ -94,23 +106,35 @@ final class SettingsManager {
         // Per-device AutoEQ headphone correction
         var deviceAutoEQ: [String: AutoEQSelection] = [:]  // deviceUID → selection
         var favoriteAutoEQProfiles: Set<String> = []  // profile IDs
+        var autoEQPreampEnabled: Bool = true  // Use profile preamp vs bypass (rely on limiter)
 
         init() {}
 
         init(from decoder: Decoder) throws {
             let c = try decoder.container(keyedBy: CodingKeys.self)
             version = try c.decodeIfPresent(Int.self, forKey: .version) ?? 8
-            appVolumes = try c.decodeIfPresent([String: Float].self, forKey: .appVolumes) ?? [:]
+            appVolumes = (try c.decodeIfPresent([String: Float].self, forKey: .appVolumes) ?? [:])
+                .filter { $0.value.isFinite && $0.value >= 0 }
+                .mapValues { min($0, 1.0) }  // Clamp old volumes > 1.0 (boost is now per-app)
             appDeviceRouting = try c.decodeIfPresent([String: String].self, forKey: .appDeviceRouting) ?? [:]
             appMutes = try c.decodeIfPresent([String: Bool].self, forKey: .appMutes) ?? [:]
+            appBoosts = try c.decodeIfPresent([String: Float].self, forKey: .appBoosts) ?? [:]
             appEQSettings = try c.decodeIfPresent([String: EQSettings].self, forKey: .appEQSettings) ?? [:]
-            appSettings = try c.decodeIfPresent(AppSettings.self, forKey: .appSettings) ?? AppSettings()
+            var decodedAppSettings = try c.decodeIfPresent(AppSettings.self, forKey: .appSettings) ?? AppSettings()
+            if !decodedAppSettings.defaultNewAppVolume.isFinite || decodedAppSettings.defaultNewAppVolume < 0 {
+                decodedAppSettings.defaultNewAppVolume = 1.0
+            }
+
+            appSettings = decodedAppSettings
             systemSoundsFollowsDefault = try c.decodeIfPresent(Bool.self, forKey: .systemSoundsFollowsDefault) ?? true
             appDeviceSelectionMode = try c.decodeIfPresent([String: DeviceSelectionMode].self, forKey: .appDeviceSelectionMode) ?? [:]
             appSelectedDeviceUIDs = try c.decodeIfPresent([String: [String]].self, forKey: .appSelectedDeviceUIDs) ?? [:]
             lockedInputDeviceUID = try c.decodeIfPresent(String.self, forKey: .lockedInputDeviceUID)
+            preferredInputDeviceUID = try c.decodeIfPresent(String.self, forKey: .preferredInputDeviceUID)
             pinnedApps = try c.decodeIfPresent(Set<String>.self, forKey: .pinnedApps) ?? []
             pinnedAppInfo = try c.decodeIfPresent([String: PinnedAppInfo].self, forKey: .pinnedAppInfo) ?? [:]
+            ignoredApps = try c.decodeIfPresent(Set<String>.self, forKey: .ignoredApps) ?? []
+            ignoredAppInfo = try c.decodeIfPresent([String: IgnoredAppInfo].self, forKey: .ignoredAppInfo) ?? [:]
             ddcVolumes = try c.decodeIfPresent([String: Int].self, forKey: .ddcVolumes) ?? [:]
             ddcMuteStates = try c.decodeIfPresent([String: Bool].self, forKey: .ddcMuteStates) ?? [:]
             ddcSavedVolumes = try c.decodeIfPresent([String: Int].self, forKey: .ddcSavedVolumes) ?? [:]
@@ -118,6 +142,7 @@ final class SettingsManager {
             inputDevicePriority = try c.decodeIfPresent([String].self, forKey: .inputDevicePriority) ?? []
             deviceAutoEQ = try c.decodeIfPresent([String: AutoEQSelection].self, forKey: .deviceAutoEQ) ?? [:]
             favoriteAutoEQProfiles = try c.decodeIfPresent(Set<String>.self, forKey: .favoriteAutoEQProfiles) ?? []
+            autoEQPreampEnabled = try c.decodeIfPresent(Bool.self, forKey: .autoEQPreampEnabled) ?? true
         }
     }
 
@@ -134,6 +159,18 @@ final class SettingsManager {
 
     func setVolume(for identifier: String, to volume: Float) {
         settings.appVolumes[identifier] = volume
+        scheduleSave()
+    }
+
+    // MARK: - Per-App Boost
+
+    func getBoost(for identifier: String) -> BoostLevel? {
+        guard let raw = settings.appBoosts[identifier] else { return nil }
+        return BoostLevel(rawValue: raw)
+    }
+
+    func setBoost(for identifier: String, to boost: BoostLevel) {
+        settings.appBoosts[identifier] = boost.rawValue
         scheduleSave()
     }
 
@@ -222,6 +259,15 @@ final class SettingsManager {
         scheduleSave()
     }
 
+    var preferredInputDeviceUID: String? {
+        settings.preferredInputDeviceUID
+    }
+
+    func setPreferredInputDeviceUID(_ uid: String?) {
+        settings.preferredInputDeviceUID = uid
+        scheduleSave()
+    }
+
     // MARK: - Pinned Apps
 
     func pinApp(_ identifier: String, info: PinnedAppInfo) {
@@ -243,6 +289,39 @@ final class SettingsManager {
     /// Returns metadata for all pinned apps
     func getPinnedAppInfo() -> [PinnedAppInfo] {
         settings.pinnedApps.compactMap { settings.pinnedAppInfo[$0] }
+    }
+
+    // MARK: - Ignored Apps
+
+    func ignoreApp(_ identifier: String, info: IgnoredAppInfo) {
+        settings.ignoredApps.insert(identifier)
+        settings.ignoredAppInfo[identifier] = info
+        // Hiding is mutually exclusive with pinning
+        settings.pinnedApps.remove(identifier)
+        settings.pinnedAppInfo.removeValue(forKey: identifier)
+        // Clear per-app settings — FineTune won't interact with this app
+        settings.appVolumes.removeValue(forKey: identifier)
+        settings.appBoosts.removeValue(forKey: identifier)
+        settings.appMutes.removeValue(forKey: identifier)
+        settings.appDeviceRouting.removeValue(forKey: identifier)
+        settings.appEQSettings.removeValue(forKey: identifier)
+        settings.appDeviceSelectionMode.removeValue(forKey: identifier)
+        settings.appSelectedDeviceUIDs.removeValue(forKey: identifier)
+        scheduleSave()
+    }
+
+    func unignoreApp(_ identifier: String) {
+        settings.ignoredApps.remove(identifier)
+        settings.ignoredAppInfo.removeValue(forKey: identifier)
+        scheduleSave()
+    }
+
+    func isIgnored(_ identifier: String) -> Bool {
+        settings.ignoredApps.contains(identifier)
+    }
+
+    func getIgnoredAppInfo() -> [IgnoredAppInfo] {
+        settings.ignoredApps.compactMap { settings.ignoredAppInfo[$0] }
     }
 
     // MARK: - DDC Monitor Volume
@@ -306,6 +385,129 @@ final class SettingsManager {
         scheduleSave()
     }
 
+    /// Merges reordered connected devices into the full priority list, preserving
+    /// disconnected device positions via an anchor algorithm.
+    ///
+    /// Each disconnected UID is anchored to the last connected UID that preceded it
+    /// in `oldPriority`. When rebuilding, disconnected UIDs are inserted after their
+    /// anchor (or at the start if no anchor exists).
+    ///
+    /// - Parameters:
+    ///   - oldPriority: The full saved priority list (connected + disconnected UIDs).
+    ///   - connectedOrder: The user's reordered list of currently-connected UIDs.
+    /// - Returns: Merged priority list preserving disconnected positions relative to connected anchors.
+    func mergeDevicePriorityOrder(oldPriority: [String], connectedOrder: [String]) {
+        settings.outputDevicePriority = Self.mergePriorityOrder(oldPriority: oldPriority, connectedOrder: connectedOrder)
+        scheduleSave()
+    }
+
+    /// Input device variant of `mergeDevicePriorityOrder`.
+    func mergeInputDevicePriorityOrder(oldPriority: [String], connectedOrder: [String]) {
+        settings.inputDevicePriority = Self.mergePriorityOrder(oldPriority: oldPriority, connectedOrder: connectedOrder)
+        scheduleSave()
+    }
+
+    /// Pure function: merges reordered connected UIDs back into the full priority list.
+    ///
+    /// Algorithm:
+    /// 1. Walk `oldPriority` and assign each disconnected UID an "anchor" — the last
+    ///    connected UID that preceded it.  UIDs with no preceding connected UID use
+    ///    `nil` anchor (inserted at the front).
+    /// 2. Build result from `connectedOrder`, inserting disconnected groups after
+    ///    their anchor.
+    /// 3. Append any connected UIDs not in `oldPriority` at the end (brand new devices).
+    static func mergePriorityOrder(oldPriority: [String], connectedOrder: [String]) -> [String] {
+        let connectedSet = Set(connectedOrder)
+
+        // Step 1: Build anchor map — disconnected UID → last connected UID before it (or nil)
+        // Also collect ordering of disconnected UIDs per anchor to preserve relative order
+        var anchoredGroups: [String?: [String]] = [:]  // anchor → [disconnected UIDs]
+        var currentAnchor: String? = nil
+
+        for uid in oldPriority {
+            if connectedSet.contains(uid) {
+                currentAnchor = uid
+            } else {
+                anchoredGroups[currentAnchor, default: []].append(uid)
+            }
+        }
+
+        // Step 2: Build result — insert disconnected groups after their anchors
+        var result: [String] = []
+
+        // First, insert any disconnected UIDs anchored to nil (they were before all connected devices)
+        if let prefixGroup = anchoredGroups[nil] {
+            result.append(contentsOf: prefixGroup)
+        }
+
+        for uid in connectedOrder {
+            result.append(uid)
+            if let group = anchoredGroups[uid] {
+                result.append(contentsOf: group)
+            }
+        }
+
+        return result
+    }
+
+    /// Removes per-app settings for apps that are no longer active, not pinned,
+    /// and have only default values. Preserves device routing (explicit user intent).
+    ///
+    /// - Parameter activeIdentifiers: Persistence identifiers of currently active apps.
+    func pruneStaleSettings(keeping activeIdentifiers: Set<String>) {
+        let allIdentifiers = Set(settings.appVolumes.keys)
+            .union(settings.appBoosts.keys)
+            .union(settings.appMutes.keys)
+            .union(settings.appEQSettings.keys)
+            .union(settings.appDeviceSelectionMode.keys)
+            .union(settings.appSelectedDeviceUIDs.keys)
+
+        var pruned = 0
+        for identifier in allIdentifiers {
+            // Keep active apps
+            if activeIdentifiers.contains(identifier) { continue }
+            // Keep pinned apps
+            if settings.pinnedApps.contains(identifier) { continue }
+            // Keep apps with explicit device routing (user intent)
+            if settings.appDeviceRouting[identifier] != nil { continue }
+
+            // Check if all remaining settings are default values
+            let volume = settings.appVolumes[identifier]
+            let mute = settings.appMutes[identifier]
+            let eq = settings.appEQSettings[identifier]
+            let selectionMode = settings.appDeviceSelectionMode[identifier]
+            let selectedUIDs = settings.appSelectedDeviceUIDs[identifier]
+
+            let boost = settings.appBoosts[identifier]
+
+            let isDefaultVolume = volume == nil || volume == 1.0
+            let isDefaultBoost = boost == nil || boost == BoostLevel.x1.rawValue
+            let isDefaultMute = mute == nil || mute == false
+            let isDefaultEQ = eq == nil || eq == .flat
+            let isDefaultSelectionMode = selectionMode == nil
+            let isDefaultSelectedUIDs = selectedUIDs == nil || selectedUIDs?.isEmpty == true
+
+            guard isDefaultVolume && isDefaultBoost && isDefaultMute && isDefaultEQ
+                    && isDefaultSelectionMode && isDefaultSelectedUIDs else {
+                continue
+            }
+
+            // All values are defaults — safe to prune
+            settings.appVolumes.removeValue(forKey: identifier)
+            settings.appBoosts.removeValue(forKey: identifier)
+            settings.appMutes.removeValue(forKey: identifier)
+            settings.appEQSettings.removeValue(forKey: identifier)
+            settings.appDeviceSelectionMode.removeValue(forKey: identifier)
+            settings.appSelectedDeviceUIDs.removeValue(forKey: identifier)
+            pruned += 1
+        }
+
+        if pruned > 0 {
+            logger.info("Pruned \(pruned) stale app settings entries")
+            scheduleSave()
+        }
+    }
+
     // MARK: - Per-Device AutoEQ
 
     func getAutoEQSelection(for deviceUID: String) -> AutoEQSelection? {
@@ -333,6 +535,14 @@ final class SettingsManager {
 
     var favoriteAutoEQProfileIDs: Set<String> {
         settings.favoriteAutoEQProfiles
+    }
+
+    var autoEQPreampEnabled: Bool {
+        get { settings.autoEQPreampEnabled }
+        set {
+            settings.autoEQPreampEnabled = newValue
+            scheduleSave()
+        }
     }
 
     // MARK: - App-Wide Settings
@@ -385,19 +595,24 @@ final class SettingsManager {
     /// Resets all per-app settings and app-wide settings to defaults
     func resetAllSettings() {
         settings.appVolumes.removeAll()
+        settings.appBoosts.removeAll()
         settings.appDeviceRouting.removeAll()
         settings.appMutes.removeAll()
         settings.appEQSettings.removeAll()
         settings.pinnedApps.removeAll()
         settings.pinnedAppInfo.removeAll()
+        settings.ignoredApps.removeAll()
+        settings.ignoredAppInfo.removeAll()
         settings.appSettings = AppSettings()
         settings.systemSoundsFollowsDefault = true
         settings.lockedInputDeviceUID = nil
+        settings.preferredInputDeviceUID = nil
         settings.ddcVolumes.removeAll()
         settings.ddcMuteStates.removeAll()
         settings.ddcSavedVolumes.removeAll()
         settings.outputDevicePriority.removeAll()
         settings.inputDevicePriority.removeAll()
+        settings.autoEQPreampEnabled = true
         settings.deviceAutoEQ.removeAll()
         settings.favoriteAutoEQProfiles.removeAll()
         settings.appDeviceSelectionMode.removeAll()

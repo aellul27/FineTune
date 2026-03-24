@@ -23,7 +23,7 @@ struct DevicePicker: View {
     @State private var currentSelectedUIDs: Set<String> = []
 
     // Configuration
-    private let triggerWidth: CGFloat = 128
+    let triggerWidth: CGFloat
     private let popoverWidth: CGFloat = 210
     private let itemHeight: CGFloat = 26
     private let itemSpacing: CGFloat = 2
@@ -150,15 +150,14 @@ struct DevicePicker: View {
                 isExpanded.toggle()
             }
         } label: {
-            HStack {
+            HStack(spacing: DesignTokens.Spacing.xs) {
                 HStack(spacing: DesignTokens.Spacing.xs) {
                     triggerIcon
                     Text(triggerText)
                         .font(.system(size: 11, weight: .medium))
                         .lineLimit(1)
                 }
-
-                Spacer(minLength: 4)
+                .frame(maxWidth: .infinity)
 
                 Image(systemName: "chevron.down")
                     .font(.system(size: 8, weight: .semibold))
@@ -210,7 +209,7 @@ struct DevicePicker: View {
             }
 
             // Device list
-            ScrollView(.vertical, showsIndicators: false) {
+            ScrollView(.vertical) {
                 LazyVStack(spacing: itemSpacing) {
                     ForEach(menuItems) { item in
                         deviceRow(for: item)
@@ -219,6 +218,7 @@ struct DevicePicker: View {
                 .padding(.vertical, 6)
                 .padding(.horizontal, 5)
             }
+            .scrollIndicators(.hidden)
             .frame(maxHeight: 220)
         }
         .frame(width: popoverWidth)
@@ -336,7 +336,7 @@ private struct DevicePickerRow: View {
                 }
             }
             .font(.system(size: 11))
-            .foregroundColor(isDisabled ? DesignTokens.Colors.textQuaternary : .primary)
+            .foregroundStyle(isDisabled ? DesignTokens.Colors.textQuaternary : .primary)
             .padding(.horizontal, 8)
             .frame(height: 26)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -428,6 +428,7 @@ extension DevicePicker {
         selectedDeviceUID: String,
         isFollowingDefault: Bool,
         defaultDeviceUID: String?,
+        triggerWidth: CGFloat = 105,
         onDeviceSelected: @escaping (String) -> Void,
         onSelectFollowDefault: @escaping () -> Void
     ) {
@@ -436,6 +437,7 @@ extension DevicePicker {
         self.selectedDeviceUIDs = []
         self.isFollowingDefault = isFollowingDefault
         self.defaultDeviceUID = defaultDeviceUID
+        self.triggerWidth = triggerWidth
         self.mode = .single
         self.onModeChange = { _ in }
         self.onDeviceSelected = onDeviceSelected
@@ -481,7 +483,8 @@ extension DevicePicker {
                         onDeviceSelected: { _ in },
                         onDevicesSelected: { selectedUIDs = $0 },
                         onSelectFollowDefault: {},
-                        showModeToggle: true
+                        showModeToggle: true,
+                        triggerWidth: 105
                     )
 
                     Text("Selected: \(selectedUIDs.count) devices")
@@ -527,7 +530,8 @@ extension DevicePicker {
                         onSelectFollowDefault: {
                             isFollowingDefault = true
                         },
-                        showModeToggle: true
+                        showModeToggle: true,
+                        triggerWidth: 105
                     )
 
                     VStack(alignment: .leading, spacing: 4) {
